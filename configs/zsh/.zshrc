@@ -87,10 +87,18 @@ source $ZSH/oh-my-zsh.sh
 
 # User configuration
 
-# export MANPATH="/usr/local/man:$MANPATH"
+export MANPATH="/usr/local/man:$MANPATH"
 
 # You may need to manually set your language environment
-# export LANG=en_US.UTF-8
+export LANG=en_US.UTF-8
+export LC_NUMERIC=el_GR.UTF-8
+export LC_MONETARY=el_GR.UTF-8
+export LC_PAPER=el_GR.UTF-8
+export LC_NAME=el_GR.UTF-8
+export LC_ADDRESS=el_GR.UTF-8
+export LC_TELEPHONE=el_GR.UTF-8
+export LC_IDENTIFICATION=el_GR.UTF-8
+export LC_ALL=en_US.UTF-8
 
 # Preferred editor for local and remote sessions
 if [[ -n $SSH_CONNECTION ]]; then
@@ -120,7 +128,9 @@ eval "$(pyenv init -)"
 
 eval "$(thefuck --alias)"
 
-alias composer="php74 /usr/lib/composer.phar"
+alias composer="php81 /usr/lib/composer.phar"
+alias composer81="php81 /usr/lib/composer.phar"
+alias composer74="php74 /usr/lib/composer.phar"
 
 if command -v tmux &> /dev/null && [ -n "$PS1" ] && [[ ! "$TERM" =~ screen ]] && [[ ! "$TERM" =~ tmux ]] && [ -z "$TMUX" ]; then
 	parent_pid=$(ps -o ppid= -p $$ | tr -d '[:space:]')
@@ -145,3 +155,6 @@ if [ -f ~/.zsh_nocorrect ]; then
 fi
 
 alias yamlparse="python3 -c 'import sys, yaml, json; json.dump(yaml.load(sys.stdin, Loader=yaml.FullLoader), sys.stdout, indent=4)'"
+
+# start sunshine in a different tmux session if it's not already running
+tmux has-session -t sunshine || tmux new-session -d -s sunshine 'sunshine'
