@@ -24,6 +24,10 @@ Plug 'danilo-augusto/vim-afterglow', { 'as': 'afterglow' }
 
 Plug 'catppuccin/vim', { 'as': 'catppuccin' }
 
+Plug 'prabirshrestha/vim-lsp'
+
+Plug 'mattn/vim-lsp-settings'
+
 call plug#end()
 
 colorscheme catppuccin_mocha
