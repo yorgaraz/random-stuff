@@ -157,4 +157,17 @@ fi
 alias yamlparse="python3 -c 'import sys, yaml, json; json.dump(yaml.load(sys.stdin, Loader=yaml.FullLoader), sys.stdout, indent=4)'"
 
 # start sunshine in a different tmux session if it's not already running
-tmux has-session -t sunshine || tmux new-session -d -s sunshine 'sunshine'
+#tmux has-session -t sunshine || tmux new-session -d -s sunshine 'sunshine'
+# Shell-GPT integration ZSH v0.1
+_sgpt_zsh() {
+if [[ -n "$BUFFER" ]]; then
+    _sgpt_prev_cmd=$BUFFER
+    BUFFER+="⌛"
+    zle -I && zle redisplay
+    BUFFER=$(sgpt --shell <<< "$_sgpt_prev_cmd")
+    zle end-of-line
+fi
+}
+zle -N _sgpt_zsh
+bindkey ^l _sgpt_zsh
+# Shell-GPT integration ZSH v0.1
