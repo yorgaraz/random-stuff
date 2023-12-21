@@ -139,6 +139,7 @@ if command -v tmux &> /dev/null && [ -n "$PS1" ] && [[ ! "$TERM" =~ screen ]] &&
 	exec tmux new-session -A -s "$session_name"
 fi
 
+alias ssh='TERM=xterm-256color ssh'
 alias k=kubectl
 alias vim=nvim
 alias vi=nvim
