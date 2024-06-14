@@ -148,6 +148,7 @@ fpath=(/home/yorgaraz/.oh-my-zsh/custom/completions /home/yorgaraz/.oh-my-zsh/pl
 
 export PATH="$PATH:~/bin"
 export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
+export PATH="~/dev_setup/maven/apache-maven-3.9.6/bin/:$PATH"
 
 if [ -f ~/.zsh_nocorrect ]; then
     while read -r COMMAND; do
@@ -172,3 +173,14 @@ fi
 zle -N _sgpt_zsh
 bindkey ^l _sgpt_zsh
 # Shell-GPT integration ZSH v0.1
+eval "$(zoxide init zsh --cmd cd)"
+
+# pnpm
+export PNPM_HOME="/home/yorgaraz/.local/share/pnpm"
+case ":$PATH:" in
+  *":$PNPM_HOME:"*) ;;
+  *) export PATH="$PNPM_HOME:$PATH" ;;
+esac
+# pnpm end
+
+alias lutris="PYENV_VERSION=system lutris"
