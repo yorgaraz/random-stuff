@@ -42,5 +42,6 @@ autocmd BufEnter * if winnr('$') == 1 && exists('b:NERDTree') && b:NERDTree.isTa
 set tabstop=4
 set shiftwidth=4
 set expandtab
+set syntax=enable
 
 let g:copilot_filetypes = {'markdown': v:true, 'yaml': v:true}
