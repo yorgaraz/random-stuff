@@ -8,6 +8,9 @@ HISTFILE=$HOME/.zhistory
 SAVEHIST=10000
 HISTSIZE=9999
 setopt HIST_EXPIRE_DUPS_FIRST
+export EDITOR=nvim
+export VISUAL=nvim
+export GPG_TTY=$(tty)
 
 # If you come from bash you might have to change your $PATH.
 # export PATH=$HOME/bin:/usr/local/bin:$PATH
@@ -81,7 +84,7 @@ COMPLETION_WAITING_DOTS="true"
 # Custom plugins may be added to $ZSH_CUSTOM/plugins/
 # Example format: plugins=(rails git textmate ruby lighthouse)
 # Add wisely, as too many plugins slow down shell startup.
-plugins=(git npm cp archlinux 1password kubectx history golang git-flow-avh kubectl nvm pip python pyenv thefuck systemd sudo tmux zsh-interactive-cd zsh-navigation-tools history-substring-search)
+plugins=(git npm cp archlinux 1password kubectx history golang git-flow-avh kubectl nvm pip python pyenv systemd sudo tmux zsh-interactive-cd zsh-navigation-tools history-substring-search)
 
 source $ZSH/oh-my-zsh.sh
 
@@ -126,11 +129,12 @@ export PYENV_ROOT="$HOME/.pyenv"
 command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
 eval "$(pyenv init -)"
 
-eval "$(thefuck --alias)"
+#eval "$(thefuck --alias)"
 
-alias composer="php81 /usr/lib/composer.phar"
-alias composer81="php81 /usr/lib/composer.phar"
-alias composer74="php74 /usr/lib/composer.phar"
+alias composer81="/usr/bin/php81 /usr/lib/composer.phar"
+alias composer82="/usr/bin/php82 /usr/lib/composer.phar"
+alias composer83="/usr/bin/php83 /usr/lib/composer.phar"
+alias composer74="/usr/bin/php74 /usr/lib/composer.phar"
 
 if command -v tmux &> /dev/null && [ -n "$PS1" ] && [[ ! "$TERM" =~ screen ]] && [[ ! "$TERM" =~ tmux ]] && [ -z "$TMUX" ]; then
 	parent_pid=$(ps -o ppid= -p $$ | tr -d '[:space:]')
@@ -143,7 +147,6 @@ alias ssh='TERM=xterm-256color ssh'
 alias k=kubectl
 alias vim=nvim
 alias vi=nvim
-alias composer81="/usr/bin/php81 /usr/lib/composer.phar"
 fpath=(/home/yorgaraz/.oh-my-zsh/custom/completions /home/yorgaraz/.oh-my-zsh/plugins/history-substring-search /home/yorgaraz/.oh-my-zsh/plugins/zsh-navigation-tools /home/yorgaraz/.oh-my-zsh/plugins/zsh-interactive-cd /home/yorgaraz/.oh-my-zsh/plugins/tmux /home/yorgaraz/.oh-my-zsh/plugins/sudo /home/yorgaraz/.oh-my-zsh/plugins/systemd /home/yorgaraz/.oh-my-zsh/plugins/thefuck /home/yorgaraz/.oh-my-zsh/plugins/pyenv /home/yorgaraz/.oh-my-zsh/plugins/python /home/yorgaraz/.oh-my-zsh/plugins/pip /home/yorgaraz/.oh-my-zsh/plugins/nvm /home/yorgaraz/.oh-my-zsh/plugins/kubectl /home/yorgaraz/.oh-my-zsh/plugins/git-flow-avh /home/yorgaraz/.oh-my-zsh/plugins/golang /home/yorgaraz/.oh-my-zsh/plugins/history /home/yorgaraz/.oh-my-zsh/plugins/kubectx /home/yorgaraz/.oh-my-zsh/plugins/1password /home/yorgaraz/.oh-my-zsh/plugins/archlinux /home/yorgaraz/.oh-my-zsh/plugins/cp /home/yorgaraz/.oh-my-zsh/plugins/npm /home/yorgaraz/.oh-my-zsh/plugins/git /home/yorgaraz/.oh-my-zsh/functions /home/yorgaraz/.oh-my-zsh/completions /home/yorgaraz/.oh-my-zsh/cache/completions /usr/local/share/zsh/site-functions /usr/share/zsh/site-functions /usr/share/zsh/functions/Calendar /usr/share/zsh/functions/Chpwd /usr/share/zsh/functions/Completion /usr/share/zsh/functions/Completion/Base /usr/share/zsh/functions/Completion/Linux /usr/share/zsh/functions/Completion/Unix /usr/share/zsh/functions/Completion/X /usr/share/zsh/functions/Completion/Zsh /usr/share/zsh/functions/Exceptions /usr/share/zsh/functions/MIME /usr/share/zsh/functions/Math /usr/share/zsh/functions/Misc /usr/share/zsh/functions/Newuser /usr/share/zsh/functions/Prompts /usr/share/zsh/functions/TCP /usr/share/zsh/functions/VCS_Info /usr/share/zsh/functions/VCS_Info/Backends /usr/share/zsh/functions/Zftp /usr/share/zsh/functions/Zle)
 
 export PATH="$PATH:~/bin"
@@ -184,3 +187,12 @@ esac
 # pnpm end
 
 alias lutris="PYENV_VERSION=system lutris"
+
+alias knch="kubectl config set-context --current --namespace"
+
+# bun completions
+[ -s "/home/yorgaraz/.oh-my-zsh/completions/_bun" ] && source "/home/yorgaraz/.oh-my-zsh/completions/_bun"
+
+# bun
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"

@@ -28,8 +28,27 @@ Plug 'prabirshrestha/vim-lsp'
 
 Plug 'mattn/vim-lsp-settings'
 
+Plug 'neovim/nvim-lspconfig'
+
+Plug 'simrat39/rust-tools.nvim'
+
+Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
+
+Plug 'junegunn/fzf.vim'
+
+Plug 'tpope/vim-dadbod'
+
+Plug 'lambdalisue/vim-suda'
+
+Plug 'mfussenegger/nvim-dap'
+
+Plug 'nvim-neotest/nvim-nio'
+
+Plug 'rcarriga/nvim-dap-ui'
+
 call plug#end()
 
+" colorscheme catppuccin_latte
 colorscheme catppuccin_mocha
 " colorscheme afterglow
 
@@ -43,5 +62,14 @@ set tabstop=4
 set shiftwidth=4
 set expandtab
 set syntax=enable
+set number
 
+let NERDTreeShowHidden=1
 let g:copilot_filetypes = {'markdown': v:true, 'yaml': v:true}
+
+command! XC call system('xclip -selection clipboard', @0)
+
+nmap <C-[> :LspDefinition<CR>
+nmap <C-]> :NERDTreeFocus<CR>
+nmap <F2> :Files<CR>
+nmap <F3> :Rg<CR>

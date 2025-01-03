@@ -10,9 +10,17 @@ fi
 
 # Check the input parameter and set resolution
 if [ "$1" = "4k" ]; then
-  xrandr --output $PRIMARY_DISPLAY --mode 3840x2160
+  xrandr --output $PRIMARY_DISPLAY --mode 3840x2160 --rate 60
 elif [ "$1" = "1080p" ]; then
-  xrandr --output $PRIMARY_DISPLAY --mode 1920x1080
+  xrandr --output $PRIMARY_DISPLAY --mode 1920x1080 --rate 60
+elif [ "$1" = "1600x900" ]; then
+  xrandr --output $PRIMARY_DISPLAY --mode 1600x900 --rate 60
+elif [ "$1" = "1366x768" ]; then
+  xrandr --output $PRIMARY_DISPLAY --mode 1366x768 --rate 60
+elif [ "$1" = "900p" ]; then
+  xrandr --output $PRIMARY_DISPLAY --mode 1600x900 --rate 60
+elif [ "$1" = "720p" ]; then
+  xrandr --output $PRIMARY_DISPLAY --mode 1280x720 --rate 60
 else
-  echo "Invalid parameter. Use '4k' or '1080p'."
+  echo "Invalid parameter. Use '4k', '1080p' or '720p'."
 fi
