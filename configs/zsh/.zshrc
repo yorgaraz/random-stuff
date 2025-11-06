@@ -136,8 +136,8 @@ alias composer82="/usr/bin/php82 /usr/lib/composer.phar"
 alias composer83="/usr/bin/php83 /usr/lib/composer.phar"
 alias composer74="/usr/bin/php74 /usr/lib/composer.phar"
 
-if command -v tmux &> /dev/null && [ -n "$PS1" ] && [[ ! "$TERM" =~ screen ]] && [[ ! "$TERM" =~ tmux ]] && [ -z "$TMUX" ]; then
-	parent_pid=$(ps -o ppid= -p $$ | tr -d '[:space:]')
+if tty -s && command -v tmux &> /dev/null && [ -n "$PS1" ] && [[ ! "$TERM" =~ screen ]] && [[ ! "$TERM" =~ tmux ]] && [ -z "$TMUX" ]; then
+    parent_pid=$(ps -o ppid= -p $$ | tr -d '[:space:]')
 	parent_process_name=$(ps -o comm= -p $parent_pid | tr -d '[:space:]')
 	session_name="$parent_process_name-$parent_pid-zrc"
 	exec tmux new-session -A -s "$session_name"
@@ -186,6 +186,59 @@ case ":$PATH:" in
 esac
 # pnpm end
 
+bwu() {
+    export BW_SESSION=$(bw unlock --raw --passwordfile ~/.bw_master_password)
+    echo "Vault unlocked."
+}
+
+# Starts a secure, interactive shell, with optional support for private images.
+# Usage: k-shell [image_name] [secret_name]
+k-shell() {
+  # Set defaults for optional arguments
+  local image_name="${1:-busybox}"
+  local secret_name="$2"
+
+  # --- Standard variables ---
+  local pod_name="shell-$(date +%s)"
+  local current_uid=$(id -u)
+  local current_gid=$(id -g)
+
+  # --- Conditionally build the imagePullSecrets JSON ---
+  local pull_secret_json=""
+  if [ -n "$secret_name" ]; then
+    pull_secret_json='"imagePullSecrets": [{ "name": "'"$secret_name"'" }],'
+    echo "🔐 Using image pull secret: $secret_name"
+  fi
+
+  echo "🚀 Starting interactive shell for UID/GID ${current_uid}/${current_gid}..."
+
+  # Run the pod, inserting the pull secret JSON if it was generated
+  kubectl run "$pod_name" \
+    --image="$image_name" \
+    -i --rm --tty \
+    --overrides='{
+      "spec": {
+        '"$pull_secret_json"'
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": '"$current_uid"',
+          "runAsGroup": '"$current_gid"',
+          "seccompProfile": { "type": "RuntimeDefault" }
+        },
+        "containers": [
+          {
+            "name": "'"$pod_name"'",
+            "image": "'"$image_name"'",
+            "stdin": true,
+            "tty": true,
+            "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] }}
+          }
+        ]
+      }
+    }' \
+    --command -- /bin/sh
+}
+
 alias lutris="PYENV_VERSION=system lutris"
 
 alias knch="kubectl config set-context --current --namespace"
@@ -196,3 +249,5 @@ alias knch="kubectl config set-context --current --namespace"
 # bun
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
+export PATH="$HOME/.npm-global/v23.9.0/lib/bin:$PATH"
+#export DISPLAY=:1
