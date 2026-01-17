@@ -251,3 +251,6 @@ export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
 export PATH="$HOME/.npm-global/v23.9.0/lib/bin:$PATH"
 #export DISPLAY=:1
+
+# opencode
+export PATH=/home/yorgaraz/.opencode/bin:$PATH
