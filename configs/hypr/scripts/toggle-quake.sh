@@ -6,7 +6,7 @@ LAUNCH_CMD="kitty --config ~/.config/kitty/kitty.conf -o 'font_size=18' --class 
 
 
 if ! command -v jq &> /dev/null; then
-    notify-send "jq is not installed" "Please install jq to use the quake-toggle script."
+    notify-send "jq is not installed" "Please install jq to use the toggle-quake script."
     exit 1
 fi
 
