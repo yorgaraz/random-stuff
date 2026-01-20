@@ -18,13 +18,3 @@ text-color=#baf2c8
 on-button-left=dismiss
 on-button-right=dismiss
 
-# --- Old 4K Home Monitor settings ---
-# This configuration was meant to "contain" notifications within a specific area of my 4K monitor.
-# It looks like hyprland update already places notifications correctly, so this config is kept for reference.
-#
-# [output=HDMI-A-1]
-# Math: 
-# Top Margin   = 900 (reserved) + 20 (padding) = 920
-# Right Margin = 600 (reserved) + 20 (padding) = 620
-# outer-margin=920,200,0,0
-
