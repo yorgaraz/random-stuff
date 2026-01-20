@@ -1,0 +1,30 @@
+anchor=top-right
+margin=10
+default-timeout=0
+font=monospace 10
+background-color=#1e1e2e
+text-color=#cdd6f4
+border-color=#89b4fa
+border-size=2
+group-by=summary
+
+on-button-left=invoke-default-action
+on-button-right=invoke-default-action
+on-button-middle=dismiss
+
+[app-name="KDE Connect"]
+background-color=#264038
+text-color=#baf2c8
+on-button-left=dismiss
+on-button-right=dismiss
+
+# --- Old 4K Home Monitor settings ---
+# This configuration was meant to "contain" notifications within a specific area of my 4K monitor.
+# It looks like hyprland update already places notifications correctly, so this config is kept for reference.
+#
+# [output=HDMI-A-1]
+# Math: 
+# Top Margin   = 900 (reserved) + 20 (padding) = 920
+# Right Margin = 600 (reserved) + 20 (padding) = 620
+# outer-margin=920,200,0,0
+
