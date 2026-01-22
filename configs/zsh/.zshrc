@@ -147,6 +147,7 @@ alias ssh='TERM=xterm-256color ssh'
 alias k=kubectl
 alias vim=nvim
 alias vi=nvim
+alias yless="jless --yaml"
 fpath=(/home/yorgaraz/.oh-my-zsh/custom/completions /home/yorgaraz/.oh-my-zsh/plugins/history-substring-search /home/yorgaraz/.oh-my-zsh/plugins/zsh-navigation-tools /home/yorgaraz/.oh-my-zsh/plugins/zsh-interactive-cd /home/yorgaraz/.oh-my-zsh/plugins/tmux /home/yorgaraz/.oh-my-zsh/plugins/sudo /home/yorgaraz/.oh-my-zsh/plugins/systemd /home/yorgaraz/.oh-my-zsh/plugins/thefuck /home/yorgaraz/.oh-my-zsh/plugins/pyenv /home/yorgaraz/.oh-my-zsh/plugins/python /home/yorgaraz/.oh-my-zsh/plugins/pip /home/yorgaraz/.oh-my-zsh/plugins/nvm /home/yorgaraz/.oh-my-zsh/plugins/kubectl /home/yorgaraz/.oh-my-zsh/plugins/git-flow-avh /home/yorgaraz/.oh-my-zsh/plugins/golang /home/yorgaraz/.oh-my-zsh/plugins/history /home/yorgaraz/.oh-my-zsh/plugins/kubectx /home/yorgaraz/.oh-my-zsh/plugins/1password /home/yorgaraz/.oh-my-zsh/plugins/archlinux /home/yorgaraz/.oh-my-zsh/plugins/cp /home/yorgaraz/.oh-my-zsh/plugins/npm /home/yorgaraz/.oh-my-zsh/plugins/git /home/yorgaraz/.oh-my-zsh/functions /home/yorgaraz/.oh-my-zsh/completions /home/yorgaraz/.oh-my-zsh/cache/completions /usr/local/share/zsh/site-functions /usr/share/zsh/site-functions /usr/share/zsh/functions/Calendar /usr/share/zsh/functions/Chpwd /usr/share/zsh/functions/Completion /usr/share/zsh/functions/Completion/Base /usr/share/zsh/functions/Completion/Linux /usr/share/zsh/functions/Completion/Unix /usr/share/zsh/functions/Completion/X /usr/share/zsh/functions/Completion/Zsh /usr/share/zsh/functions/Exceptions /usr/share/zsh/functions/MIME /usr/share/zsh/functions/Math /usr/share/zsh/functions/Misc /usr/share/zsh/functions/Newuser /usr/share/zsh/functions/Prompts /usr/share/zsh/functions/TCP /usr/share/zsh/functions/VCS_Info /usr/share/zsh/functions/VCS_Info/Backends /usr/share/zsh/functions/Zftp /usr/share/zsh/functions/Zle)
 
 export PATH="$PATH:~/bin"
@@ -254,3 +255,8 @@ export PATH="$HOME/.npm-global/v23.9.0/lib/bin:$PATH"
 
 # opencode
 export PATH=/home/yorgaraz/.opencode/bin:$PATH
+
+# Added by LM Studio CLI (lms)
+export PATH="$PATH:/home/yorgaraz/.lmstudio/bin"
+# End of LM Studio CLI section
+
