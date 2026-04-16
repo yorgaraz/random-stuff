@@ -12,12 +12,24 @@ fi
 CLIENTS=$(hyprctl clients -j)
 QUAKE_INFO=$(echo "$CLIENTS" | jq ".[] | select(.class==\"$TERM_CLASS\" and .title==\"$TERM_TITLE\")")
 
+force_absolute_position() {
+    local MON_INFO=$(hyprctl monitors -j | jq '.[] | select(.focused==true)')
+    local MON_X=$(echo "$MON_INFO" | jq '.x')
+    local MON_Y=$(echo "$MON_INFO" | jq '.y')
+    hyprctl keyword animations:enabled false
+    hyprctl dispatch movewindowpixel exact $MON_X $MON_Y,title:^$TERM_TITLE$
+    hyprctl keyword animations:enabled true
+}
+
 if [ -z "$QUAKE_INFO" ]; then
     eval "$LAUNCH_CMD"
     sleep 0.3
     ACTIVE_WORKSPACE_ID=$(hyprctl activeworkspace -j | jq '.id')
     hyprctl dispatch movetoworkspace "$ACTIVE_WORKSPACE_ID,title:^$TERM_TITLE$"
     hyprctl dispatch pin "title:^$TERM_TITLE$"
+
+    force_absolute_position
+
     hyprctl dispatch focuswindow "title:^$TERM_TITLE$"
     exit 0
 fi
@@ -32,11 +44,16 @@ if [ "$WORKSPACE_ID" -lt 0 ]; then
     if [ "$IS_PINNED" = "false" ]; then
         hyprctl dispatch pin "title:^$TERM_TITLE$"
     fi
+
+    force_absolute_position
+
     hyprctl dispatch focuswindow "title:^$TERM_TITLE$"
 else
     # It is visible. UNPIN it first, then hide it.
     if [ "$IS_PINNED" = "true" ]; then
         hyprctl dispatch pin "title:^$TERM_TITLE$"
     fi
+    hyprctl keyword animations:enabled false
     hyprctl dispatch movetoworkspacesilent "special:quaketerminal,title:^$TERM_TITLE$"
+    hyprctl keyword animations:enabled true
 fi
