@@ -52,7 +52,7 @@ zstyle ':omz:update' mode auto      # update automatically without asking
 # DISABLE_LS_COLORS="true"
 
 # Uncomment the following line to disable auto-setting terminal title.
-# DISABLE_AUTO_TITLE="true"
+DISABLE_AUTO_TITLE="true"
 
 # Uncomment the following line to enable command auto-correction.
 ENABLE_CORRECTION="true"
@@ -143,7 +143,9 @@ if tty -s && command -v tmux &> /dev/null && [ -n "$PS1" ] && [[ ! "$TERM" =~ sc
 	exec tmux new-session -A -s "$session_name"
 fi
 
-alias ssh='TERM=xterm-256color ssh'
+ssh() {
+  TERM=xterm-256color command ssh "$@"
+}
 alias k=kubectl
 alias vim=nvim
 alias vi=nvim
@@ -260,4 +262,21 @@ export PATH=/home/yorgaraz/.opencode/bin:$PATH
 # Added by LM Studio CLI (lms)
 export PATH="$PATH:/home/yorgaraz/.lmstudio/bin"
 # End of LM Studio CLI section
+
+
+autoload -Uz add-zsh-hook
+
+function _force_tmux_pane_title() {
+  if [[ -n "$TMUX" ]]; then
+    local current_host="${HOST%%.*}"
+
+    if [[ -n "$SSH_CLIENT" || -n "$SSH_TTY" || "$USER" == "root" ]]; then
+      print -Pn "\e]2; %n / 󰒋 %m /  %1~\a"
+    else
+      print -Pn "\e]2; %1~\a"
+    fi
+  fi
+}
+
+add-zsh-hook precmd _force_tmux_pane_title
 
