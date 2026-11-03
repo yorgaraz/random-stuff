@@ -18,6 +18,8 @@ Plug 'terryma/vim-multiple-cursors'
 
 Plug 'tribela/vim-transparent'
 
+Plug 'f-person/git-blame.nvim'
+
 " Plug 'github/copilot.vim'
 
 Plug 'danilo-augusto/vim-afterglow', { 'as': 'afterglow' }
