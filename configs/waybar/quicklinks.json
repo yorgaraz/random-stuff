@@ -1,0 +1,13 @@
+{
+  "custom/quicklink1": {
+    "format": "",
+    "on-click": "chromium",
+    "tooltip-format": "Chromium"
+  },
+  "group/quicklinks": {
+    "orientation": "horizontal",
+    "modules": [
+      "custom/quicklink1"
+    ]
+  }
+}

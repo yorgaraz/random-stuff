@@ -1,0 +1,16 @@
+[soe][Crystalizer#0]
+adaptiveIntensity=false
+intensityBand0=21
+intensityBand1=8
+intensityBand10=11
+intensityBand11=14
+intensityBand12=14
+intensityBand2=6
+intensityBand3=2
+intensityBand4=-4
+intensityBand5=-5
+intensityBand6=-6
+intensityBand7=-8
+intensityBand8=-6
+intensityBand9=7
+oversamplingQuality=10

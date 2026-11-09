@@ -1,0 +1,9 @@
+[soe][Loudness#0]
+bypass=true
+clippingRange=0
+fft=6
+std=0
+volume=-5
+
+[soe][Loudness#1]
+outputGain=26

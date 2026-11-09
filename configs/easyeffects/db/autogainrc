@@ -1,0 +1,6 @@
+[soe][Autogain#0]
+maximumHistory=6
+outputGain=-26.63
+reference=0
+silenceThreshold=-20
+target=0
