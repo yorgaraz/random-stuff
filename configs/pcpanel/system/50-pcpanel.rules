@@ -1,0 +1,13 @@
+// /etc/polkit-1/rules.d/50-pcpanel.rules
+// yorgaraz may start/restart, no password: nvme-ps-cap.service (boot cap) and any pcpanel-*.service.
+// A new root control = one unit file in /etc/systemd/system named pcpanel-<name>.service; no change here.
+polkit.addRule(function (action, subject) {
+    if (action.id != "org.freedesktop.systemd1.manage-units" || subject.user != "yorgaraz")
+        return polkit.Result.NOT_HANDLED;
+    var unit = action.lookup("unit") || "";
+    var verb = action.lookup("verb");
+    if ((unit == "nvme-ps-cap.service" || /^pcpanel-[A-Za-z0-9_-]+\.service$/.test(unit)) &&
+        (verb == "start" || verb == "restart"))
+        return polkit.Result.YES;
+    return polkit.Result.NOT_HANDLED;
+});

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# pcpanel: small PC control panel (rofi menu + waybar indicator).
+# Switch 1: root NVMe power cap (nvme-ps-cap / pcpanel-ssd-uncap units, polkit lets yorgaraz run them).
+#   pcpanel menu          rofi menu of switches
+#   pcpanel status        waybar JSON
+#   pcpanel ssd cap|uncap|toggle
+set -uo pipefail
+
+STATE=/run/nvme-ps-state          # written by /usr/local/bin/nvme-ps-cap: "ps=<n> at=<iso time>"
+WAYBAR_SIGNAL=9                   # matches "signal" of custom/pcpanel in waybar
+
+ssd_ps()   { [[ -r $STATE ]] && sed -n 's/^ps=\([0-9]*\).*/\1/p' "$STATE"; }
+ssd_at()   { [[ -r $STATE ]] && sed -n 's/.* at=\(.*\)$/\1/p' "$STATE"; }
+ssd_label() {
+  case "$(ssd_ps)" in
+    0)  echo "full speed" ;;
+    "") echo "unknown" ;;
+    *)  echo "capped (PS$(ssd_ps))" ;;
+  esac
+}
+
+ssd_set() {
+  local out rc
+  case "$1" in
+    cap)   out=$(systemctl restart nvme-ps-cap.service 2>&1); rc=$? ;;
+    uncap) out=$(systemctl start pcpanel-ssd-uncap.service 2>&1); rc=$? ;;
+    *)     echo "usage: pcpanel ssd cap|uncap|toggle" >&2; return 2 ;;
+  esac
+  pkill -RTMIN+$WAYBAR_SIGNAL waybar 2>/dev/null
+  if (( rc )); then
+    notify-send -u critical "pcpanel: SSD $1 failed" "$out"
+  else
+    notify-send "pcpanel" "Root SSD: $(ssd_label)"
+  fi
+  return $rc
+}
+
+# Unknown state toggles to cap: the safe side.
+ssd_toggle() { case "$(ssd_ps)" in ""|0) ssd_set cap ;; *) ssd_set uncap ;; esac; }
+
+status() {
+  local ps cls text
+  ps=$(ssd_ps)
+  case "$ps" in
+    0)  cls=uncapped; text="󰋊 full" ;;
+    "") cls=unknown;  text="󰋊 ?" ;;
+    *)  cls=capped;   text="󰋊 cap" ;;
+  esac
+  printf '{"text":"%s","class":"%s","tooltip":"Root SSD: %s\\nsince %s\\nLeft: panel  Right: toggle"}\n' \
+    "$text" "$cls" "$(ssd_label)" "$(ssd_at || echo '-')"
+}
+
+menu() {
+  local next choice
+  case "$(ssd_ps)" in ""|0) next="cap it (6.75 W)" ;; *) next="release (full speed)" ;; esac
+  choice=$(printf '%s\n' "SSD power: $(ssd_label) → $next" | rofi -dmenu -i -p "PC panel") || return 0
+  case "$choice" in
+    "SSD power:"*) ssd_toggle ;;
+  esac
+}
+
+case "${1:-menu}" in
+  menu)   menu ;;
+  status) status ;;
+  ssd)    case "${2:-}" in toggle) ssd_toggle ;; *) ssd_set "${2:-}" ;; esac ;;
+  *)      sed -n '3,6p' "$0" >&2; exit 2 ;;
+esac

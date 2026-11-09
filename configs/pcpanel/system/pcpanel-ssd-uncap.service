@@ -1,0 +1,10 @@
+# /etc/systemd/system/pcpanel-ssd-uncap.service — not enabled; started on demand by pcpanel.
+# Boot default stays capped via nvme-ps-cap.service.
+[Unit]
+Description=Release the root NVMe (03:00.0) power cap, back to PS0 full speed (pcpanel)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+Environment=NVME_PS=0
+ExecStart=/usr/local/bin/nvme-ps-cap
