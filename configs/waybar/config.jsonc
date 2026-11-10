@@ -31,7 +31,6 @@
     "group/hardware",
     "custom/pcpanel",
     "upower",
-    "user",
     "clock",
     "custom/notification"
   ]
