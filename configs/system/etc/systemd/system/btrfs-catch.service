@@ -1,0 +1,15 @@
+[Unit]
+Description=Stream the kernel log to the crash-log SSD; snapshot it on btrfs/nvme/memory errors
+Wants=mnt-crashlog.mount
+After=mnt-crashlog.mount efi.automount
+
+[Service]
+ExecStart=/usr/local/bin/btrfs-catch
+Restart=always
+RestartSec=5
+Nice=-5
+# POSIX TZ string: file names stay local time even when /etc/localtime cannot be read.
+Environment=TZ=EET-2EEST,M3.5.0/3,M10.5.0/4
+
+[Install]
+WantedBy=multi-user.target

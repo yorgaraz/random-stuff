@@ -1,0 +1,11 @@
+[Unit]
+Description=Cap the root NVMe (03:00.0) at power state 1, 6.75 W (btrfs-diag test, 2026-10-31)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/nvme-ps-cap
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Crash-log volume (LV pve/crashlog on the Proxmox SSD)
+
+[Mount]
+What=/dev/disk/by-uuid/ac3a6424-193b-4815-802c-0152f6b82c44
+Where=/mnt/crashlog
+Type=ext4
+Options=noatime,data=journal,commit=1,nofail
+
+[Install]
+WantedBy=multi-user.target

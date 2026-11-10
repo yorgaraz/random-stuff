@@ -1,0 +1,14 @@
+[Unit]
+Description=MCPO Native Shell Assistant
+After=network.target
+
+[Service]
+Type=simple
+User=yorgaraz
+WorkingDirectory=/home/yorgaraz/dev/personal/AI/open-webui/mcpo-native
+ExecStart=/home/yorgaraz/dev/personal/AI/open-webui/mcpo-native/run.sh
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

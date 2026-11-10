@@ -1,0 +1,12 @@
+[Unit]
+Description=Set MTU for ZeroTier Interface
+After=network.target
+Wants=zerotier-one.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/set-zerotier-mtu.sh
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,11 @@
+[Unit]
+Description=Safe volume (LV pve/safe on the Proxmox SSD): data that must survive a root-drive drop
+
+[Mount]
+What=/dev/disk/by-uuid/bb45c726-d1de-4eb4-bee6-6c1a92136405
+Where=/mnt/safe
+Type=ext4
+Options=noatime,nodelalloc,commit=1,nofail
+
+[Install]
+WantedBy=multi-user.target
