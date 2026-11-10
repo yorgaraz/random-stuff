@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# atlas-telemetry — stream + record system vitals for crash forensics.
+# Every sample is fsync'd, so after a hard freeze the log survives up to
+# ~2s before death. Run locally in a terminal before a gaming session, or
+# better, from another machine so the stream survives even a total freeze:
+#   ssh yorgaraz@192.168.2.9 .local/bin/atlas-telemetry | tee atlas-session.log
+set -u
+DIR="$HOME/telemetry"
+mkdir -p "$DIR"
+LOG="$DIR/session-$(date +%Y%m%d-%H%M%S).log"
+
+note() { printf '%s\n' "$*" | tee -a "$LOG"; sync -d "$LOG"; }
+
+note "# telemetry start $(date '+%F %T') kernel=$(uname -r) log=$LOG"
+
+# kernel messages (GPU Xid, MCE/WHEA, USB, btrfs) woven into the same log
+journalctl -kf -o short-iso --no-pager --since now 2>/dev/null | while IFS= read -r line; do
+    printf 'KMSG %s\n' "$line" | tee -a "$LOG"
+    sync -d "$LOG"
+done &
+KPID=$!
+trap 'kill $KPID 2>/dev/null; note "# telemetry stop $(date "+%F %T")"; exit 0' INT TERM
+
+while true; do
+    # CPU: Tctl + per-CCD die temps
+    cpu=$(sensors -u 'k10temp-*' 2>/dev/null | awk '
+        /temp1_input/{tctl=$2} /temp3_input/{c1=$2} /temp4_input/{c2=$2}
+        END{printf "%.0f(ccd%.0f/%.0f)", tctl, c1, c2}')
+    # Both NVMe composite temps (nvme0/nvme1 order)
+    nvme=$(sensors -u 'nvme-pci-*' 2>/dev/null | awk '
+        /temp1_input/{printf "%s%.0f", s, $2; s="/"}')
+    # Motherboard temps + fan RPMs, if a Super I/O chip is exposed (modprobe nct6775)
+    board=$(sensors -u 'nct*' 2>/dev/null | awk '
+        /temp[0-9]+_input/{t=t s1 sprintf("%.0f",$2); s1="/"}
+        /fan[0-9]+_input/{f=f s2 sprintf("%.0f",$2); s2="/"}
+        END{if (t!="" || f!="") printf " board=%sC fans=%srpm", t, f}')
+    gpu=$(nvidia-smi --query-gpu=temperature.gpu,power.draw,utilization.gpu,memory.used,clocks.sm \
+          --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | tr ',' '/')
+    read -r used total <<< "$(free -m | awk '/^Mem:/{print $3, $2}')"
+    swap=$(free -m | awk '/^Swap:/{print $3}')
+    load=$(cut -d' ' -f1-3 /proc/loadavg)
+    psi=$(awk -F'avg10=' '/^some/{split($2,a," "); print a[1]; exit}' /proc/pressure/memory 2>/dev/null)
+    printf '%s cpu=%sC nvme=%sC gpu[t/W/util/vram/clk]=%s%s mem=%s/%sMiB swap=%sMiB load=%s mempsi=%s\n' \
+        "$(date '+%F %T')" "${cpu:-?}" "${nvme:-?}" "${gpu:-?}" "$board" \
+        "$used" "$total" "${swap:-0}" "$load" "${psi:-?}" | tee -a "$LOG"
+    sync -d "$LOG"
+    sleep 2
+done

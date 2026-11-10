@@ -1,0 +1,285 @@
+#!/bin/bash
+# btrfs-catch: keep the kernel log and the machine's vital signs on a second disk, so a dying root fs or root drive can't lose them.
+# Everything in the loops uses bash builtins only: on 2026-10-25 the root NVMe dropped off the bus
+# and every exec (dmesg, cat, timeout, even PATH lookups) failed with I/O errors.
+# Files per start in /mnt/crashlog/kmsg/ (Proxmox SSD, data=journal,commit=1):
+# 1. <start>.log      every kernel line.
+# 2. <start>.sensors  every 5 s, CSV, header = column names: every hwmon sensor (NVMe, CPU, board temps/volts/fans),
+#                     I/O of each NVMe drive, PCIe link + AER error totals of each NVMe and its upstream port, load, PSI, memory.
+# 3. <start>.procio   every 5 s: the top 5 processes by disk I/O.
+# 4. <start>.gpu      every 5 s: nvidia-smi (temp, power, load, VRAM, clocks, PCIe, throttle reasons).
+# 5. <start>.journal  the user-space journal, minus kernel lines (in .log) and sshd / warp-svc noise.
+# On a btrfs / nvme / memory error, a snapshot (trigger, meminfo, PSI, temps) goes to /mnt/crashlog/dumps.
+# When the root drive is gone (go from the user, 2026-10-28): wait RECOVER_WAIT, power off, the clock alarm powers
+# the PC back on RTC_WAKE later. A full power cut, not a reboot: that is what brings the drive back.
+# Skipped in the first MIN_UPTIME after boot (no loop) or while $STOP exists.
+set -u
+LOG=${BTRFS_CATCH_LOG:-/mnt/crashlog}
+EFI=${BTRFS_CATCH_EFI:-/efi/btrfs-catch}
+MAX_DUMPS=20
+COOLDOWN=120
+MAX_LINES=500000
+KEEP_MB=1200
+TICK=5
+PAT='BTRFS (error|critical|warning)|Transaction aborted|tree-checker|corrupt (leaf|node)|forced readonly|nvme.*(timeout|reset|controller is down|I/O error)|blk_update_request|Machine check|Hardware Error|EDAC.*(CE|UE|[Ee]rror)|Out of memory|page allocation failure|general protection|BUG:|Oops'
+RECOVER_WAIT=${BTRFS_CATCH_RECOVER_WAIT:-60}
+RTC_WAKE=60
+MIN_UPTIME=${BTRFS_CATCH_MIN_UPTIME:-900}
+STOP=${BTRFS_CATCH_STOP:-/mnt/safe/no-auto-reboot}
+# BTRFS_CATCH_DRYRUN=1 (tests): log the power-off steps instead of doing them.
+DRYRUN=${BTRFS_CATCH_DRYRUN:-}
+
+start_ts() { printf -v "$1" '%(%F_%H%M%S)T' -1; }
+start_ts tts
+
+# Delete the oldest files of earlier starts until kmsg/ is under KEEP_MB. Uses exec: only called while the root fs answers.
+prune() {
+    local f total
+    total=$(du -sm "$LOG/kmsg" | cut -f1)
+    while IFS= read -r f; do
+        (( total <= KEEP_MB )) && break
+        [[ ${f##*/} == "$tts".* ]] && continue
+        total=$(( total - $(du -m "$f" | cut -f1) ))
+        rm -f "$f"
+    done < <(ls -1tr "$LOG"/kmsg/* 2>/dev/null)
+}
+
+mkdir -p "$EFI"
+# An explicit BTRFS_CATCH_LOG (tests) is trusted without being a mount point.
+if [[ -n ${BTRFS_CATCH_LOG:-} ]] || mountpoint -q "$LOG"; then
+    mkdir -p "$LOG/kmsg" "$LOG/dumps"
+    prune
+    DUMPS=$LOG/dumps
+else
+    echo "btrfs-catch: $LOG not mounted, streaming off, snapshots to $EFI only" >&2
+    LOG=
+    DUMPS=$EFI
+fi
+
+# fd 4: a pipe nobody writes to, so `read -t N -u 4` is a sleep without exec.
+exec 4<> <(:)
+nap() { read -t "$1" -u 4 _ ; }
+
+# PCI address of a sysfs device, e.g. 03:00.0. Exec, startup only.
+pci_of() { local p; p=$(readlink -f "$1"); p=${p%/nvme/*}; printf '%s' "${p##*/0000:}"; }
+
+# Every hwmon *_input file, resolved now while the root fs still answers.
+SENS=() COLS=() NVME_HW=() NVME_LBL=()
+for h in /sys/class/hwmon/hwmon*; do
+    read -r chip 2>/dev/null < "$h/name" || continue
+    if [[ $chip == nvme ]]; then
+        chip+="@$(pci_of "$h/device")"
+        NVME_HW+=("$h"); NVME_LBL+=("$chip")
+    fi
+    for f in "$h"/*_input; do
+        [[ -e $f ]] || continue
+        l=${f##*/}; l=${l%_input}
+        [[ -r ${f%_input}_label ]] && read -r l < "${f%_input}_label"
+        SENS+=("$f"); COLS+=("$chip.${l// /_}")
+    done
+done
+for i in "${!NVME_HW[@]}"; do
+    echo "btrfs-catch: ${NVME_HW[$i]##*/} = ${NVME_LBL[$i]} = $(readlink -f "${NVME_HW[$i]}/device")"
+done
+
+# Each NVMe block device (I/O counters), and each NVMe controller + its upstream port (link, AER totals).
+# Column names follow sensors_line's output order: all disks first, then all PCI devices.
+DISKS=() PCIDEVS=() DCOLS=() PCOLS=()
+for b in /sys/block/nvme*; do
+    [[ -e $b/stat ]] || continue
+    a=$(pci_of "$b/device")
+    DISKS+=("$b/stat"); DCOLS+=("io@$a.rKBs" "io@$a.wKBs" "io@$a.inflight")
+    d=$(readlink -f "$b/device"); d=${d%/nvme/*}
+    for p in "$d" "${d%/*}"; do
+        PCIDEVS+=("$p"); a=${p##*/0000:}
+        PCOLS+=("pci@$a.GTs" "pci@$a.width" "pci@$a.aer_cor" "pci@$a.aer_nonfatal" "pci@$a.aer_fatal")
+    done
+done
+COLS+=("${DCOLS[@]}" "${PCOLS[@]}" load1 psi.cpu.some10 psi.io.some10 psi.io.full10 psi.mem.full10 mem.availKB mem.dirtyKB mem.writebackKB)
+
+# The root drive is gone: its NVMe controller gave up, or btrfs lost its device. Exec, startup only.
+GONE='has gone missing'
+r=$(findmnt -n -o SOURCE /); r=${r%%"["*}
+r=$(readlink -f "/sys/class/block/${r#/dev/}"); r=$(readlink -f "${r%/*}/device")
+[[ ${r##*/} == nvme* ]] && GONE="nvme ${r##*/}: Disabling device after reset failure|$GONE"
+echo "btrfs-catch: auto-recover on: $GONE"
+
+temps() {
+    local i t out=
+    for i in "${!NVME_HW[@]}"; do
+        t=; read -r t 2>/dev/null < "${NVME_HW[$i]}/temp1_input"
+        out+=" ${NVME_LBL[$i]}=${t:-?}"
+    done
+    printf '%s' "$out"
+}
+
+# Last value of a "TOTAL_* N" line in an AER counter file.
+aer_total() {
+    local k v t=?
+    while read -r k v; do [[ $k == TOTAL_* ]] && t=$v; done 2>/dev/null < "$1"
+    printf '%s' "$t"
+}
+
+# avg10 of the "some" or "full" line of a /proc/pressure file.
+psi10() {
+    local kind a rest
+    while read -r kind a rest; do [[ $kind == "$2" ]] && { printf '%s' "${a#avg10=}"; return; }; done 2>/dev/null < "$1"
+    printf '?'
+}
+
+declare -A PREV_SECT
+sensors_line() {
+    local out v i s f k a b x avail=? dirty=? wb=?
+    printf -v out '%(%F %T)T' -1
+    for f in "${SENS[@]}"; do v=?; read -r v 2>/dev/null < "$f"; out+=",${v:-?}"; done
+    for f in "${DISKS[@]}"; do
+        s=(); read -r -a s 2>/dev/null < "$f"
+        if (( ${#s[@]} >= 9 )); then
+            a=${PREV_SECT[$f.r]:-${s[2]}}; b=${PREV_SECT[$f.w]:-${s[6]}}
+            out+=",$(( (s[2] - a) / 2 / TICK )),$(( (s[6] - b) / 2 / TICK )),${s[8]}"
+            PREV_SECT[$f.r]=${s[2]}; PREV_SECT[$f.w]=${s[6]}
+        else
+            out+=",?,?,?"
+        fi
+    done
+    for f in "${PCIDEVS[@]}"; do
+        v=?; read -r v x 2>/dev/null < "$f/current_link_speed"; out+=",$v"
+        v=?; read -r v 2>/dev/null < "$f/current_link_width"; out+=",$v"
+        out+=",$(aer_total "$f/aer_dev_correctable"),$(aer_total "$f/aer_dev_nonfatal"),$(aer_total "$f/aer_dev_fatal")"
+    done
+    v=?; read -r v x < /proc/loadavg; out+=",$v"
+    out+=",$(psi10 /proc/pressure/cpu some),$(psi10 /proc/pressure/io some),$(psi10 /proc/pressure/io full),$(psi10 /proc/pressure/memory full)"
+    while read -r k v x; do
+        case $k in MemAvailable:) avail=$v ;; Dirty:) dirty=$v ;; Writeback:) wb=$v ;; esac
+    done < /proc/meminfo
+    printf '%s\n' "$out,$avail,$dirty,$wb"
+}
+
+# Top 5 processes by bytes read + written to storage since the last tick: "pid/comm/readKB/writtenKB".
+declare -A PREV_R PREV_W
+procio_line() {
+    local d pid k v r w dr dw t i comm out
+    local -A NOW_R NOW_W
+    local -a top_t=() top_s=()
+    for d in /proc/[0-9]*; do
+        pid=${d#/proc/}; r=; w=
+        while read -r k v; do
+            case $k in read_bytes:) r=$v ;; write_bytes:) w=$v ;; esac
+        done 2>/dev/null < "$d/io"
+        [[ -n $r && -n $w ]] || continue
+        NOW_R[$pid]=$r; NOW_W[$pid]=$w
+        [[ -n ${PREV_R[$pid]:-} ]] || continue
+        dr=$(( (r - PREV_R[$pid]) / 1024 )); dw=$(( (w - PREV_W[$pid]) / 1024 ))
+        t=$(( dr + dw ))
+        (( t > 0 )) || continue
+        comm=?; read -r comm 2>/dev/null < "$d/comm"
+        top_t+=("$t"); top_s+=("$pid/${comm// /_}/$dr/$dw")
+        # keep the list at 5: drop the smallest
+        if (( ${#top_t[@]} > 5 )); then
+            k=0
+            for i in "${!top_t[@]}"; do (( top_t[i] < top_t[k] )) && k=$i; done
+            unset 'top_t[k]' 'top_s[k]'; top_t=("${top_t[@]}"); top_s=("${top_s[@]}")
+        fi
+    done
+    PREV_R=(); PREV_W=()
+    for pid in "${!NOW_R[@]}"; do PREV_R[$pid]=${NOW_R[$pid]}; PREV_W[$pid]=${NOW_W[$pid]}; done
+    printf -v out '%(%F %T)T' -1
+    printf '%s %s\n' "$out" "${top_s[*]}"
+}
+
+open_log() {
+    local ts
+    start_ts ts
+    if [[ -n $LOG ]]; then exec 3>>"$LOG/kmsg/$ts.log"; else exec 3>/dev/null; fi
+    lines=0
+}
+
+snapshot() {
+    local ts f l
+    nap 5             # let the full call trace arrive
+    start_ts ts
+    f="$DUMPS/$ts.txt"
+    {
+        echo "== trigger: $1"
+        echo "== nvme temps:$(temps)"
+        echo "== meminfo"; while IFS= read -r l; do echo "$l"; done < /proc/meminfo
+        echo "== pressure"
+        for l in /proc/pressure/*; do echo "${l##*/}:"; while IFS= read -r p; do echo "  $p"; done < "$l"; done
+        echo "== gpu (exec, may fail if the root drive is gone)"
+        nvidia-smi --query-gpu=memory.used,memory.total,temperature.gpu --format=csv 2>&1
+    } > "$f" 2>&1
+    [[ $DUMPS != "$EFI" ]] && cp "$f" "$EFI/" 2>/dev/null
+}
+
+# A timestamped line of our own in the kernel log file.
+note() { printf '%(%FT%T)T btrfs-catch: %s\n' -1 "$1" >&3; }
+
+# Power-cycle the PC. Builtins only: runs with the root drive gone.
+recover() {
+    local up x
+    read -r up x < /proc/uptime; up=${up%.*}
+    if (( up < MIN_UPTIME )); then
+        note "root drive gone at ${up}s uptime: auto-recover skipped (< ${MIN_UPTIME}s)"; return
+    fi
+    note "root drive gone: power off in ${RECOVER_WAIT}s, back on ${RTC_WAKE}s later"
+    nap "$RECOVER_WAIT"
+    if [[ -e $STOP ]]; then note "auto-recover skipped: $STOP exists"; return; fi
+    if [[ -n $DRYRUN ]]; then note "DRYRUN: wakealarm +$RTC_WAKE, sysrq s, sysrq o"; return; fi
+    echo 0 > /sys/class/rtc/rtc0/wakealarm
+    echo "+$RTC_WAKE" > /sys/class/rtc/rtc0/wakealarm
+    echo s > /proc/sysrq-trigger    # emergency sync: flushes the healthy disks
+    nap 5
+    note "powering off"
+    echo o > /proc/sysrq-trigger
+}
+
+open_log
+if [[ -n $LOG ]]; then
+    K=$LOG/kmsg
+    (
+        exec 5>>"$K/$tts.sensors"
+        IFS=,; printf '# time,%s\n' "${COLS[*]}" >&5; unset IFS
+        n=0
+        while :; do
+            sensors_line >&5
+            (( ++n % 720 == 0 )) && prune 2>/dev/null   # hourly; exec, fails harmlessly once the root drive is gone
+            nap "$TICK"
+        done
+    ) &
+    (
+        exec 5>>"$K/$tts.procio"
+        echo "# time pid/comm/readKB/writtenKB (top 5 by storage I/O in the last ${TICK}s)" >&5
+        while :; do procio_line >&5; nap "$TICK"; done
+    ) &
+    nvidia-smi --query-gpu=timestamp,temperature.gpu,power.draw,utilization.gpu,utilization.memory,memory.used,clocks.sm,clocks.mem,pcie.link.gen.current,pcie.link.width.current,fan.speed,clocks_event_reasons.active \
+        --format=csv -l "$TICK" >> "$K/$tts.gpu" 2>&1 &
+    (
+        exec 5>>"$K/$tts.journal"
+        skip=0
+        journalctl -f -n 0 -o short-iso-precise 2>&1 | while IFS= read -r l; do
+            # continuation lines of a dropped message start with whitespace
+            if [[ $l == [[:space:]]* ]]; then (( skip )) && continue; else skip=0; fi
+            [[ $l == *" kernel: "* || $l == *" sshd"*"]: "* || $l == *" warp-svc["* ]] && { skip=1; continue; }
+            printf '%s\n' "$l" >&5
+        done
+    ) &
+fi
+
+last=0
+dumps=0
+recovering=0
+# dmesg --follow replays the whole ring buffer first: stream it, but don't trigger on it.
+replay=$(dmesg | wc -l)
+seen=0
+dmesg --follow --time-format iso | while IFS= read -r line; do
+    printf '%s\n' "$line" >&3
+    (( ++lines >= MAX_LINES )) && open_log
+    (( ++seen <= replay )) && continue
+    [[ $line =~ $PAT ]] || continue
+    if (( ! recovering )) && [[ $line =~ $GONE ]]; then recovering=1; recover & fi
+    printf -v now '%(%s)T' -1
+    (( now - last < COOLDOWN || dumps >= MAX_DUMPS )) && continue
+    last=$now
+    (( ++dumps ))
+    snapshot "$line" &
+done

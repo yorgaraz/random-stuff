@@ -1,0 +1,40 @@
+#!/usr/bin/python3 -I
+# Caps the root NVMe (PCI 0000:03:00.0, Phison E16) at a lower power state. Not saved in the drive: resets on power-off.
+# Power states (smartctl -c, 2026-10-31): PS0 9.78 W, PS1 6.75 W, PS2 5.23 W. PS3/PS4 are idle states (not used).
+# Talks to the drive with the kernel's NVMe admin ioctl (Set/Get Features, FID 2), so it needs no nvme-cli.
+# Undo now: NVME_PS=0 nvme-ps-cap
+import fcntl, glob, os, struct, sys, time
+
+PCI = os.environ.get("NVME_PS_PCI", "0000:03:00.0")
+PS = int(os.environ.get("NVME_PS", "1"))
+STATE = "/run/nvme-ps-state"          # world-readable, for pcpanel: "ps=<n> at=<iso time>"
+NVME_IOCTL_ADMIN_CMD = 0xC0484E41   # _IOWR('N', 0x41, struct nvme_admin_cmd), 72 bytes
+CMD = "<BBHIIIQQII6III"             # opcode flags rsvd nsid cdw2 cdw3 meta addr meta_len data_len cdw10-15 timeout result
+
+
+def admin(fd, opcode, cdw10, cdw11=0):
+    buf = bytearray(struct.pack(CMD, opcode, 0, 0, 0, 0, 0, 0, 0, 0, 0, cdw10, cdw11, 0, 0, 0, 0, 0, 0))
+    status = fcntl.ioctl(fd, NVME_IOCTL_ADMIN_CMD, buf)
+    if status:
+        sys.exit(f"nvme-ps-cap: NVMe status {status:#x} for opcode {opcode:#x}")
+    return struct.unpack(CMD, buf)[-1]
+
+
+for c in glob.glob("/sys/class/nvme/nvme*"):
+    if open(f"{c}/address").read().strip() != PCI:
+        continue
+    dev = "/dev/" + os.path.basename(c)
+    fd = os.open(dev, os.O_RDONLY)
+    before = admin(fd, 0x0A, 0x02) & 0x1F       # Get Features, current value
+    admin(fd, 0x09, 0x02, PS)                   # Set Features, not saved
+    after = admin(fd, 0x0A, 0x02) & 0x1F
+    print(f"nvme-ps-cap: {dev} ({PCI}) power state {before} -> {after}")
+    try:
+        with open(STATE + ".tmp", "w") as f:
+            f.write(f"ps={after} at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
+        os.chmod(STATE + ".tmp", 0o644)
+        os.replace(STATE + ".tmp", STATE)
+    except OSError as e:
+        print(f"nvme-ps-cap: state file not written: {e}", file=sys.stderr)
+    sys.exit(0 if after == PS else 1)
+sys.exit(f"nvme-ps-cap: no controller at {PCI}")
