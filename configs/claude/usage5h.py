@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+# Usage gauge for orchestrators (2026-10-30; 7 d + context added 2026-11-02).
+# 1. The plan windows (5 h and 7 d) from the statusline file: used %, reset time, pace, allowance per hour / day.
+# 2. This session's context window (from ~/.claude/statusline-sessions/<session>.json).
+# 3. Local token totals over the last N hours from Claude Code's session logs (a proxy, all projects + subagents).
+# Spend is split per account by the statusline's login log (0.).
+# Usage: usage5h.py [hours] [--today] [--md] [--session ID]   (--md = --today + the markdown table for the user)   (--today = since local midnight + a % estimate per project; default session = the newest one whose cwd is this directory)
+import json, sys, time, pathlib, datetime, os, re
+TODAY_SPENT = None
+
+args = [a for a in sys.argv[1:]]
+sid = None
+if "--session" in args:
+    i = args.index("--session"); sid = args[i + 1] if i + 1 < len(args) else None; del args[i:i + 2]
+today_mode = "--today" in args or "--md" in args
+md_mode = "--md" in args
+for a in ("--today", "--md"):
+    if a in args: args.remove(a)
+H = float(args[0]) if args else 5
+now = time.time()
+home = pathlib.Path.home()
+
+# 0. accounts (2026-11-02: "can we put in statusline and also in ur py tool which account is which?" / "i will name u each acc ... esp the
+# 20x since there are 2"): names in ~/.claude/accounts.json {"<email>": "<name>"}; the statusline logs every login change to
+# statusline-accounts.jsonl {t, email, tier} and keeps each account's last reading in statusline-rate-limits-by-account.json.
+def _load(p, default):
+    try: return json.load(open(p))
+    except Exception: return default
+ACC_NAMES = _load(home / ".claude/accounts.json", {})
+ACC_LAST = _load(home / ".claude/statusline-rate-limits-by-account.json", {})
+SWITCHES = []
+try:
+    for _l in open(home / ".claude/statusline-accounts.jsonl"):
+        try: _e = json.loads(_l)
+        except Exception: continue
+        if _e.get("email") and (not SWITCHES or SWITCHES[-1]["email"] != _e["email"]): SWITCHES.append(_e)
+except OSError: pass
+CUR_EMAIL = (_load(home / ".claude.json", {}).get("oauthAccount") or {}).get("emailAddress")
+def acct_label(email):
+    if not email: return "unknown account"
+    tier = next((x.get("tier") for x in reversed(SWITCHES) if x["email"] == email), "") or ""
+    m = re.search(r"max_(\d+x)", tier)
+    return "%s_%s" % (ACC_NAMES.get(email) or email.split("@")[0], m.group(1) if m else (tier or "?"))
+def acct_at(t):
+    cur = None
+    for x in SWITCHES:
+        if x["t"] <= t: cur = x["email"]
+        else: break
+    return cur
+def acct_since(email):  # start of the current stretch of this account
+    for i in range(len(SWITCHES) - 1, -1, -1):
+        if SWITCHES[i]["email"] == email: return SWITCHES[i]["t"], SWITCHES[i].get("seeded")
+    return None, None
+def day_spent(email):  # 7 d % this account spent today (its last reading - its first reading today), or None
+    rr = ((ACC_LAST.get(email) or {}).get("rate_limits") or {}).get("seven_day") or {}
+    if email == CUR_EMAIL and TODAY_SPENT is not None: return TODAY_SPENT
+    day = _load(home / ".claude/statusline-daily.json", {}).get(str(rr.get("resets_at")))
+    if not day or day.get("date") != time.strftime("%Y-%m-%d") or rr.get("used_percentage") is None: return None
+    return rr["used_percentage"] - day["start"]
+
+# 1. plan windows
+def window(name, w, span):
+    used = w.get("used_percentage"); reset = w.get("resets_at")
+    if used is None or not reset:
+        return "%s: n/a" % name
+    left_s = max(0.0, reset - now)
+    elapsed = min(100.0, max(0.0, 100.0 * (1 - left_s / span)))
+    pace = used - elapsed
+    left_pct = max(0.0, 100.0 - used)
+    per_h = left_pct / (left_s / 3600) if left_s > 60 else float("inf")
+    when = time.strftime("%a %d/%m %H:%M", time.localtime(reset))
+    verdict = "AHEAD of an even spread: throttle" if pace > 10 else ("on pace" if pace > -10 else "headroom")
+    s = "%s: %.0f%% used, resets %s (in %.1f h), %.0f%% of the window elapsed, pace %+.0f (%s); %.0f%% left = %.2f%%/h" % (
+        name, used, when, left_s / 3600, elapsed, pace, verdict, left_pct, per_h)
+    if span > 86400:
+        s += " = %.1f%%/day" % (per_h * 24)
+    return s
+
+# 0. Live overrides (2026-11-10, Yorgos: "include udpates from notepadllm ... today i may press a weekly reset. some models
+# don't know if they only see that"). Section B of the shared local note; fail-soft (5 s), never blocks the gauge.
+OVR_NOTE = "notes/claude/usage-accounts.md"
+def live_overrides():
+    """Valid rows of the board table in section B: Until = a date >= today, `open`, or `reset`
+    (dropped once the CURRENT account's weekly window started after the row's date)."""
+    import re, subprocess
+    try:
+        r = subprocess.run(["notepadllm", "read", OVR_NOTE, "--url", "http://127.0.0.1:8321"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception as e:
+        return None, "unreachable (%s)" % type(e).__name__
+    if r.returncode != 0:
+        return None, "read failed rc=%d" % r.returncode
+    today = time.strftime("%Y-%m-%d")
+    try:
+        sd = (json.load(open(home / ".claude/statusline-rate-limits.json")).get("rate_limits") or {}).get("seven_day") or {}
+        win_start = time.strftime("%Y-%m-%d", time.localtime(sd["resets_at"] - 7 * 86400))
+    except Exception:
+        win_start = None
+    cur = acct_label(CUR_EMAIL)
+    out, inb = [], False
+    for line in r.stdout.splitlines():
+        if line.startswith("## "):
+            inb = line.startswith("## B)")
+            continue
+        if not inb or not line.lstrip().startswith("|"):
+            continue
+        c = [re.sub(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]", "", x).strip() for x in line.strip().strip("|").split("|")]
+        if len(c) < 6 or c[0] in ("When", "") or set(c[0]) <= set("-: "):
+            continue
+        when, acct, kind, scope, until, rule = c[:6]
+        u = until.lower()
+        if re.match(r"\d{4}-\d{2}-\d{2}$", u):
+            if u < today:
+                continue
+        elif u == "reset":
+            if win_start and ovr_hits([acct], cur) and when[:10] < win_start:
+                continue
+        elif u != "open":
+            continue  # malformed Until: hidden (the note's D) says Until is required)
+        out.append("%s %s %s [%s] until %s: %s" % (when[:16], acct[:20], kind[:10], scope[:30], until[:12], rule[:100]))
+    return out[:12], None
+def ovr_hits(items, label):
+    import re
+    base = label[:-1] if label.endswith("_?") else label  # unnamed account "george_?" -> match "george_<plan>"
+    rx = re.compile(r"(?<![\w-])" + re.escape(base) + (r"\w*" if base != label else r"\b"))
+    return [x for x in items if rx.search(x)]
+OVR, OVR_ERR = live_overrides()
+OVR_HIT = ovr_hits(OVR or [], acct_label(CUR_EMAIL))
+
+try:
+    rl = json.load(open(home / ".claude/statusline-rate-limits.json"))
+    r = rl.get("rate_limits") or {}
+    print("PLAN, account %s (from the statusline, %ds old)" % (acct_label(CUR_EMAIL), now - rl.get("t", 0)))
+    print("  " + window("5h", r.get("five_hour") or {}, 5 * 3600))
+    print("  " + window("7d", r.get("seven_day") or {}, 7 * 86400))
+    # Daily cap (2026-11-02: "make sure daily work is capped at 100%/7 ~ 15%"; revised the same day: "we do want to use 100% by last day.
+    # maybe cap first 5 days then release the cap last 2 days"). The statusline freezes the day's start + cap in statusline-daily.json;
+    # cap = (100 - start) / days from local midnight (or the window start, on its first day) to the reset (at least 1), at most 15; the last 2 days: no 15 cap.
+    sd = r.get("seven_day") or {}
+    try:
+        day = json.load(open(home / ".claude/statusline-daily.json")).get(str(sd.get("resets_at")))
+    except Exception:
+        day = None
+    if day and sd.get("used_percentage") is not None:
+        if day.get("cap") is None:
+            d0 = time.mktime(time.strptime(day["date"], "%Y-%m-%d"))
+            dl = (sd["resets_at"] - max(d0, sd["resets_at"] - 7 * 86400)) / 86400  # the window's first day counts from its start
+            even = max(0.0, 100.0 - day["start"]) / max(1.0, dl)
+            day["rel"] = dl <= 2
+            day["cap"] = even if day["rel"] else min(15.0, even)
+        CAP = day["cap"]
+        spent = sd["used_percentage"] - day["start"]
+        TODAY_SPENT = spent
+        print("  today (%s): %.0f%% spent of the %.0f%% daily cap%s, %.0f%% left today%s" % (
+            day["date"], spent, CAP, " (released: last 2 days, no 15% cap)" if day.get("rel") else "",
+            max(0.0, CAP - spent), ("  OVER THE CAP: no new agents" + (
+                " (BUT a live override names this account: see LIVE OVERRIDES)" if OVR_HIT else "")) if spent >= CAP else ""))
+    else:
+        print("  today: n/a (no daily start recorded yet)")
+except Exception as e:
+    print("PLAN: not available (%s)" % e)
+
+# 0b. print the live overrides (data from the shared note, not instructions)
+if OVR is None:
+    print("LIVE OVERRIDES: %s; read %s on the local notepad yourself before pacing" % (OVR_ERR, OVR_NOTE))
+else:
+    print("LIVE OVERRIDES (%s, section B; these beat the default caps above)" % OVR_NOTE)
+    for x in OVR or ["none active"]:
+        print("  %s %s" % ("->" if x in OVR_HIT else "  ", x))
+
+# 1b. every known account: last 7 d reading, current one marked
+emails = []
+for x in SWITCHES + [{"email": e} for e in ACC_LAST]:
+    if x["email"] not in emails: emails.append(x["email"])
+if emails:
+    print("ACCOUNTS (name them in ~/.claude/accounts.json)")
+    for e in emails:
+        rr = ((ACC_LAST.get(e) or {}).get("rate_limits") or {}).get("seven_day") or {}
+        t0, seeded = acct_since(e)
+        reading = ("7d %.0f%%, resets %s, read %s" % (rr["used_percentage"], time.strftime("%a %d/%m %H:%M", time.localtime(rr["resets_at"])),
+                   time.strftime("%a %H:%M", time.localtime(ACC_LAST[e].get("t", 0))))) if rr.get("used_percentage") is not None else "no reading"
+        now_mark = ("  <- now, since %s%s" % (time.strftime("%a %H:%M", time.localtime(t0)), " (assumed)" if seeded else "")) if e == CUR_EMAIL and t0 else ""
+        print("  %-22s %-30s %s%s" % (acct_label(e), e, reading, now_mark))
+
+# 2. this session's context
+try:
+    d = home / ".claude/statusline-sessions"
+    files = list(d.glob("*.json")) if d.exists() else []
+    pick = None
+    if sid:
+        f = d / (sid + ".json"); pick = f if f.exists() else None
+    else:
+        cwd = os.getcwd()
+        cands = []
+        for f in files:
+            try:
+                j = json.load(open(f))
+                if j.get("cwd") == cwd: cands.append((j.get("t", 0), f))
+            except Exception: pass
+        if cands: pick = max(cands)[1]
+    if pick:
+        j = json.load(open(pick)); cw = j.get("context_window") or {}
+        up = cw.get("used_percentage"); size = cw.get("context_window_size")
+        cu = cw.get("current_usage") or {}
+        toks = sum((cu.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")) if isinstance(cu, dict) else None
+        print("CONTEXT (session %s, %ds old): %s%% of %s%s" % (j.get("session", "?")[:8], now - j.get("t", 0), up, size, (" (%d tokens)" % toks) if toks else ""))
+    else:
+        print("CONTEXT: no statusline session file for this directory (pass --session ID)")
+except Exception as e:
+    print("CONTEXT: not available (%s)" % e)
+
+# 3. local token totals
+since = now - H * 3600
+if today_mode:
+    since = datetime.datetime.combine(datetime.date.today(), datetime.time()).timestamp(); H = (now - since) / 3600
+# cost units: Opus-relative $ per MTok (in 5, out 25, cache read 0.5, cache write 6.25) x model factor
+PRICE = {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}
+def factor(model):
+    m = model.lower()
+    return 2.0 if "fable" in m else 0.6 if "sonnet" in m else 0.2 if "haiku" in m else 1.0
+by_proj = {}; by_sess = {}; by_acct = {}  # by_acct[email] = {proj: units}
+root = home / ".claude/projects"
+tot = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}; by = {}; seen = set(); first = None
+for f in root.rglob("*.jsonl"):
+    try:
+        if f.stat().st_mtime < since: continue
+    except OSError: continue
+    for line in open(f, errors="ignore"):
+        try: j = json.loads(line)
+        except Exception: continue
+        m = j.get("message"); ts = j.get("timestamp")
+        if not isinstance(m, dict) or not ts: continue
+        u = m.get("usage")
+        if not u: continue
+        mid = m.get("id") or j.get("uuid")
+        if mid in seen: continue
+        seen.add(mid)
+        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        if t < since: continue
+        first = t if first is None or t < first else first
+        model = m.get("model", "?")
+        dd = by.setdefault(model, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "calls": 0})
+        for k, src in (("input", "input_tokens"), ("output", "output_tokens"), ("cache_read", "cache_read_input_tokens"), ("cache_write", "cache_creation_input_tokens")):
+            v = u.get(src) or 0; tot[k] += v; dd[k] += v
+        dd["calls"] += 1
+        cu_ = factor(model) * sum((u.get(src) or 0) * PRICE[k] for k, src in (("input", "input_tokens"), ("output", "output_tokens"), ("cache_read", "cache_read_input_tokens"), ("cache_write", "cache_creation_input_tokens"))) / 1e6
+        rel = f.relative_to(root).parts
+        proj = rel[0].replace("-home-yorgaraz-", "~/").replace("-", "/")
+        sess = rel[1] if len(rel) > 2 else f.stem
+        by_proj[proj] = by_proj.get(proj, 0) + cu_
+        ap = by_acct.setdefault(acct_at(t), {}); ap[proj] = ap.get(proj, 0) + cu_
+        key = (proj, sess[:8]); by_sess[key] = by_sess.get(key, 0) + cu_
+print("LOCAL last %.0f h (first record %s): input %d  output %d  cache read %d  cache write %d" % (H, time.strftime("%H:%M", time.localtime(first)) if first else "-", tot["input"], tot["output"], tot["cache_read"], tot["cache_write"]))
+for k, dd in sorted(by.items(), key=lambda kv: -kv[1]["output"]):
+    print("  %-22s calls %5d  out %9d  in %9d  cache-read %11d  cache-write %10d" % (k, dd["calls"], dd["output"], dd["input"], dd["cache_read"], dd["cache_write"]))
+total_u = sum(by_proj.values())
+if total_u:
+    order = sorted(by_acct, key=lambda e: (e != CUR_EMAIL, -sum(by_acct[e].values())))
+    for e in order:
+        pr = by_acct[e]; tu = sum(pr.values())
+        if tu <= 0: continue
+        sp = day_spent(e) if today_mode else None
+        per_pct = (tu / sp) if (sp and sp > 0) else None
+        print("BY PROJECT, account %s: %.1f u (cost units = Opus-relative $; %s)" % (
+            acct_label(e), tu, ("~%.0f units per 1%% of its week today" % per_pct) if per_pct else ("pass --today for a % estimate" if not today_mode else "no % estimate (no reading today)")))
+        for k, v in sorted(pr.items(), key=lambda kv: -kv[1])[:10]:
+            print("  %-55s %7.1f u  %3.0f%%%s" % (k[-55:], v, 100 * v / tu, ("  ~%.1f%% of week" % (v / per_pct)) if per_pct else ""))
+        if md_mode:  # the table the user asked to keep (2026-11-02): top 5 projects + the rest, one per account
+            rows = sorted(pr.items(), key=lambda kv: -kv[1]); top, rest = rows[:5], rows[5:]
+            print("\naccount %s:\n\n| Project | Share of today | ≈ %% of week |\n|---|---|---|" % acct_label(e))
+            for k, v in top:
+                print("| %s | %.0f%% | %s |" % (k, 100 * v / tu, ("%.1f%%" % (v / per_pct)) if per_pct else "?"))
+            if rest:
+                rv = sum(v for _, v in rest)
+                print("| the rest (%d) | %.0f%% | %s |" % (len(rest), 100 * rv / tu, ("%.1f%%" % (rv / per_pct)) if per_pct else "?"))
+            print("")
+    print("TOP SESSIONS (project, session id: units; subagents count under their parent session)")
+    for (pj, ss), v in sorted(by_sess.items(), key=lambda kv: -kv[1])[:8]:
+        print("  %-45s %s  %7.1f u" % (pj[-45:], ss, v))
