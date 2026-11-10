@@ -1,0 +1,2 @@
+settings set target.inline-breakpoint-strategy always
+command script import "/home/yorgaraz/dev/unreal/5_6/Engine/Build/BatchFiles/Linux/../../../Extras/LLDBDataFormatters/UEDataFormatters_2ByteChars.py"
