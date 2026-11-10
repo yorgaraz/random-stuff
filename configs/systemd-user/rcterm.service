@@ -1,0 +1,16 @@
+# systemd USER unit of the rcterm helper. `bash tools/rcterm/setup.sh --service` fills /home/yorgaraz/Backup/dev/gta/Projects/rcmenu and installs it.
+# WAYLAND_DISPLAY / XDG_RUNTIME_DIR come from the user manager; run `systemctl --user import-environment WAYLAND_DISPLAY`
+# if the clipboard (wl-copy / wl-paste) does not work from the service (the helper logs the value at start).
+[Unit]
+Description=rcterm helper for the in-game terminal
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/home/yorgaraz/Backup/dev/gta/Projects/rcmenu/build/rcterm-venv/bin/python -I -m rcterm run
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
