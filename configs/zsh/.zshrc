@@ -191,7 +191,13 @@ esac
 # pnpm end
 
 bwu() {
-    export BW_SESSION=$(bw unlock --raw --passwordfile ~/.bw_master_password)
+    # Fail loudly: an empty session must never count as unlocked (agents chain `bwu && ...`).
+    local s
+    s=$(bw unlock --raw --nointeraction --passwordfile ~/.bw_master_password) && [ -n "$s" ] || {
+        echo "Vault unlock FAILED (check WARP / bw login)" >&2
+        return 1
+    }
+    export BW_SESSION=$s
     echo "Vault unlocked."
 }
 
