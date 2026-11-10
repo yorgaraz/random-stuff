@@ -1,0 +1,125 @@
+{
+    "output": {
+        "bass_enhancer#0": {
+            "amount": 27.999999999999886,
+            "blend": 3.0,
+            "bypass": false,
+            "floor": 36.0,
+            "floor-active": true,
+            "harmonics": 6.4000000000000075,
+            "input-gain": -0.1,
+            "output-gain": -12.1,
+            "scope": 48.0
+        },
+        "bass_loudness#0": {
+            "bypass": false,
+            "input-gain": 0.0,
+            "link": -8.000000000000005,
+            "loudness": -3.2,
+            "output": -7.999999999999993,
+            "output-gain": 0.0
+        },
+        "blocklist": [],
+        "crystalizer#0": {
+            "band0": {
+                "bypass": false,
+                "intensity": 0.0,
+                "mute": false
+            },
+            "band1": {
+                "bypass": false,
+                "intensity": -1.0,
+                "mute": false
+            },
+            "band10": {
+                "bypass": false,
+                "intensity": -10.0,
+                "mute": false
+            },
+            "band11": {
+                "bypass": false,
+                "intensity": -11.0,
+                "mute": false
+            },
+            "band12": {
+                "bypass": false,
+                "intensity": -13.0,
+                "mute": false
+            },
+            "band2": {
+                "bypass": false,
+                "intensity": -2.0,
+                "mute": false
+            },
+            "band3": {
+                "bypass": false,
+                "intensity": -3.0,
+                "mute": false
+            },
+            "band4": {
+                "bypass": false,
+                "intensity": -4.0,
+                "mute": false
+            },
+            "band5": {
+                "bypass": false,
+                "intensity": -5.0,
+                "mute": false
+            },
+            "band6": {
+                "bypass": false,
+                "intensity": -6.0,
+                "mute": false
+            },
+            "band7": {
+                "bypass": false,
+                "intensity": -7.0,
+                "mute": false
+            },
+            "band8": {
+                "bypass": false,
+                "intensity": -8.0,
+                "mute": false
+            },
+            "band9": {
+                "bypass": false,
+                "intensity": -9.0,
+                "mute": false
+            },
+            "bypass": false,
+            "input-gain": 0.0,
+            "output-gain": 0.0
+        },
+        "loudness#0": {
+            "bypass": false,
+            "clipping": false,
+            "clipping-range": 0.0,
+            "fft": "16384",
+            "input-gain": 0.0,
+            "output-gain": 0.0,
+            "std": "Flat",
+            "volume": -5.0
+        },
+        "plugins_order": [
+            "bass_enhancer#0",
+            "loudness#0",
+            "crystalizer#0",
+            "bass_loudness#0",
+            "reverb#0"
+        ],
+        "reverb#0": {
+            "amount": -5.000000000000025,
+            "bass-cut": 80.0,
+            "bypass": false,
+            "decay-time": 1.0,
+            "diffusion": 0.7200000000000002,
+            "dry": 2.0000000000000004,
+            "hf-damp": 8000.0,
+            "input-gain": 0.0,
+            "output-gain": 0.0,
+            "predelay": 0.14999999999999997,
+            "room-size": "Large/smooth",
+            "treble-cut": 12000.0
+        }
+    }
+}

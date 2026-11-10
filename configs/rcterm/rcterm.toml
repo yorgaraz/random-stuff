@@ -1,0 +1,24 @@
+# rcterm helper settings (docs/in-game-terminal-spec.md B9). Every key is optional.
+# game_dir = ""                 # empty = search the Steam prefixes for GTA V Enhanced
+# key_file = ""                 # empty = <game_dir>/scripts/rcmod/terminal/key
+port = 7782
+tmux = "/usr/bin/tmux"
+tmux_socket = ""                # e.g. "-L rcterm-test" (tests); empty = the default tmux server
+session_prefix = "rcterm-"
+cleanup_stale = true
+size_policy = "auto"            # auto (ignore-size while one of your own clients is on the group) | latest | ignore
+keepalive_sec = 45                # a script reload keeps the client this long (the game says keepAlive); a game exit releases it at once
+retry_ms = 1000
+flush_interval_ms = 16
+quiet_ms = 2
+targets_poll_ms = 2000
+max_paste_bytes = 1048576
+max_copy_bytes = 100000
+read_only_all = false
+allow_test_targets = true      # test:* fixtures (the in-game test catalog turns this on)
+log = ""                        # empty = ~/.local/state/rcterm/rcterm.log
+
+# [profiles.name]
+# command = ["ssh", "box", "-t", "tmux", "attach"]
+# read_only = false
+# tmux_socket = ""              # a profile without a command attaches a tmux server on that socket

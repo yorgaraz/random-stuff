@@ -1,0 +1,6 @@
+[Desktop Entry]
+Exec=/home/yorgaraz/.config/old-autostart-scripts/add-ssh-keys.sh
+Icon=application-x-executable-script
+Name=add-ssh-keys.sh
+Type=Application
+X-KDE-AutostartScript=true
