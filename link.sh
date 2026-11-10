@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# dlink.sh: recreate every dotfile link listed in links.conf.
-#   ./dlink.sh            check + fix your own links (kind "link")
-#   ./dlink.sh -n         dry run: only show what would change
-#   ./dlink.sh --root     also do the root entries (rootlink / rootcopy), via sudo
-# Safe to re-run: a correct link is left alone; a real file in the way is kept as <target>.pre-dlink-<date>.
+# link.sh: recreate every dotfile link listed in links.conf.
+#   ./link.sh            check + fix your own links (kind "link")
+#   ./link.sh -n         dry run: only show what would change
+#   ./link.sh --root     also do the root entries (rootlink / rootcopy), via sudo
+# Safe to re-run: a correct link is left alone; a real file in the way is kept as <target>.pre-link-<date>.
 set -uo pipefail
 
 REPO=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -15,7 +15,7 @@ for a in "$@"; do
     -n|--dry-run) DRY=1 ;;
     --root)       ROOT=1 ;;
     -h|--help)    sed -n '2,6p' "$0"; exit 0 ;;
-    *)            echo "dlink: unknown option $a" >&2; exit 2 ;;
+    *)            echo "link: unknown option $a" >&2; exit 2 ;;
   esac
 done
 
@@ -29,8 +29,8 @@ do_link() {   # $1 sudo-prefix ("" or "sudo"), $2 src, $3 dest
     ok=$((ok+1)); return
   fi
   if [[ -e $dest || -L $dest ]] && [[ ! -L $dest ]]; then
-    say backup "$dest -> $dest.pre-dlink-$STAMP"
-    run $S mv "$dest" "$dest.pre-dlink-$STAMP" || { failed=$((failed+1)); return; }
+    say backup "$dest -> $dest.pre-link-$STAMP"
+    run $S mv "$dest" "$dest.pre-link-$STAMP" || { failed=$((failed+1)); return; }
   elif [[ -L $dest ]]; then
     say relink "$dest (was -> $(readlink "$dest"))"
     run $S rm "$dest" || { failed=$((failed+1)); return; }
@@ -67,5 +67,5 @@ done < "$MANIFEST"
 
 (( NEED_RELOAD && ! DRY )) && sudo systemctl daemon-reload
 
-echo "dlink: $ok ok, $changed changed, $failed failed$( (( skipped )) && echo ", $skipped root entries skipped (use --root)")$( (( DRY )) && echo " [dry run]")"
+echo "link: $ok ok, $changed changed, $failed failed$( (( skipped )) && echo ", $skipped root entries skipped (use --root)")$( (( DRY )) && echo " [dry run]")"
 (( failed == 0 ))
