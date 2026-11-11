@@ -93,7 +93,23 @@ def live_overrides():
     today = time.strftime("%Y-%m-%d")
     try:
         sd = (json.load(open(home / ".claude/statusline-rate-limits.json")).get("rate_limits") or {}).get("seven_day") or {}
-        win_start = time.strftime("%Y-%m-%d", time.localtime(sd["resets_at"] - 7 * 86400))
+        reset_at = float(sd["resets_at"])
+        # A weekly reset only moves after the old one has passed. The statusline once reported a 7 d reset a week ahead
+        # right after a 5 h reset (2026-11-11 02:50), which hid `Until reset` rows. Keep the earliest future reset seen
+        # per account and ignore a forward jump while that one is still ahead.
+        cache_f = home / ".claude/usage-weekly-resets.json"
+        cache = _load(cache_f, {})
+        known = cache.get(CUR_EMAIL or "?")
+        nowt = time.time()
+        if known and nowt < known < reset_at:
+            reset_at = known
+        elif not known or known <= nowt or reset_at < known:
+            cache[CUR_EMAIL or "?"] = reset_at
+            try:
+                json.dump(cache, open(cache_f, "w"))
+            except OSError:
+                pass
+        win_start = time.strftime("%Y-%m-%d", time.localtime(reset_at - 7 * 86400))
     except Exception:
         win_start = None
     cur = acct_label(CUR_EMAIL)
