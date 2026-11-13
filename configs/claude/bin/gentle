@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# gentle: run heavy work (cargo build/test/mutants, docker builds, Playwright, -P16 test runs) without hurting the desktop.
+# Yorgos 2026-11-13: "if we can throttle it somehow while i play, that would be nice" (after a hard reset with
+# cargo-mutants running beside a game).
+#
+#   gentle [--wait] [--] <command...>   run it throttled; exit code = the command's
+#   gentle --check                      print what runs now (game? top CPU, GPU apps); exit 0 = calm, 3 = a game runs
+#
+# Always: its own user cgroup scope (CPUWeight=10, MemoryHigh=40% of RAM), nice 19, ionice idle.
+# A game running: CPUWeight=1, only 8 of the cores (taskset), CARGO_BUILD_JOBS / NEXTEST_TEST_THREADS / MAKEFLAGS = 4.
+# --wait: hold until no game runs (checks every 60 s), then run.
+set -u
+
+GAME_RX='steamapps/common|GTA5|HTGame|PlayGTAV|proton.*waitforexitandrun|gamescope'
+SKIP_COMM='^(bash|zsh|sh|dash|fish|pgrep|grep|rg|ps|python3?|node|claude|gentle|tmux|less|vim|nvim|code)$'
+
+game_pids() {
+  ps -eo pid=,comm=,args= 2>/dev/null | while read -r pid comm args; do
+    [[ "$comm" =~ $SKIP_COMM ]] && continue
+    [[ "$args" =~ $GAME_RX ]] && echo "$pid $comm"
+  done
+}
+
+check() {
+  local g; g=$(game_pids | head -3)
+  echo "game: ${g:-none}" | tr '\n' ' '; echo
+  echo "top cpu:"; ps -eo pid,pcpu,pmem,comm --sort=-pcpu | sed -n '2,6p'
+  echo "gpu apps:"
+  local gpu
+  if gpu=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1); then
+    echo "${gpu:-  none}"
+  else
+    echo "  (nvidia-smi unavailable)"
+  fi
+  [ -n "$g" ] && return 3 || return 0
+}
+
+wait_flag=0
+case "${1:-}" in
+  --check) check; exit $? ;;
+  --wait) wait_flag=1; shift ;;
+  -h|--help|"") sed -n '2,12p' "$0"; exit 2 ;;
+esac
+[ "${1:-}" = "--" ] && shift
+[ $# -eq 0 ] && { echo "gentle: no command" >&2; exit 2; }
+
+if [ $wait_flag -eq 1 ]; then
+  while [ -n "$(game_pids)" ]; do echo "gentle: a game runs; waiting 60 s" >&2; sleep 60; done
+fi
+
+mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+mem_high="$(( mem_kb * 40 / 100 ))K"
+weight=10
+pin=()
+if [ -n "$(game_pids)" ]; then
+  weight=1
+  n=$(nproc); first=$(( n > 8 ? n - 8 : 0 ))
+  pin=(taskset -c "${first}-$(( n - 1 ))")
+  export CARGO_BUILD_JOBS=4 NEXTEST_TEST_THREADS=4 MAKEFLAGS=-j4
+  echo "gentle: a game runs; limiting to 8 cores, 4 jobs" >&2
+fi
+
+if systemd-run --user --scope -q -p CPUWeight=$weight -p MemoryHigh=$mem_high true 2>/dev/null; then
+  exec systemd-run --user --scope -q -p CPUWeight=$weight -p MemoryHigh=$mem_high \
+    "${pin[@]}" nice -n 19 ionice -c3 "$@"
+fi
+exec "${pin[@]}" nice -n 19 ionice -c3 "$@"
