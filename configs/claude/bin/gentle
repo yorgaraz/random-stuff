@@ -28,7 +28,7 @@ check() {
   echo "gpu apps:"
   local gpu
   if gpu=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1); then
-    echo "${gpu:-  none}"
+    if [ -n "$gpu" ]; then echo "$gpu" | awk -F", " '{n=split($2,a,"/"); split(a[n],b," "); printf "  %s %s %s\n", $1, b[1], $NF}'; else echo "  none"; fi
   else
     echo "  (nvidia-smi unavailable)"
   fi
