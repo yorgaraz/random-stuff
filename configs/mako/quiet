@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# quiet: forced quiet mode for notifications, driven by the waybar bell (also linked as ~/.local/bin/quiet-mode).
+#
+#   quiet toggle | on | off    set the mako mode "quiet", then refresh the waybar module (no notification)
+#   quiet status               one line of waybar JSON: text, class (off | forced | auto), tooltip
+#   quiet is-quiet             exit 0 when "quiet" or "fullscreen" is on, 1 otherwise (for other scripts)
+#
+# Two mako modes hide everything but the emergency lane (see configs/mako/config):
+#   quiet       forced, set here only
+#   fullscreen  auto, set only by fullscreen-watch (a loud fullscreen window or a game)
+# forced wins when both are on. Never fails: makoctl trouble reads as "off".
+set -u
+SIGNAL=10   # waybar "signal" of the custom/quiet module
+
+modes() { makoctl mode 2>/dev/null; }
+has() { modes | grep -qx "$1"; }
+
+case "${1:-}" in
+  toggle|on|off)
+    case "$1" in toggle) f=-t ;; on) f=-a ;; off) f=-r ;; esac
+    makoctl mode "$f" quiet >/dev/null 2>&1
+    pkill -RTMIN+"$SIGNAL" -x waybar 2>/dev/null
+    exit 0 ;;
+  status)
+    m=$(modes)
+    forced=0 auto=0
+    grep -qx quiet <<<"$m" && forced=1
+    grep -qx fullscreen <<<"$m" && auto=1
+    if (( forced )); then
+      printf '{"text":"%s","class":"forced","tooltip":"%s"}\n' "󰂛" "Forced quiet is ON: only emergencies show.\nClick: toggle forced quiet"
+    elif (( auto )); then
+      printf '{"text":"%s","class":"auto","tooltip":"%s"}\n' "󰂜" "Quiet for now (fullscreen window or a game).\nClick: toggle forced quiet"
+    else
+      printf '{"text":"%s","class":"off","tooltip":"%s"}\n' "󰂚" "Notifications are on.\nClick: toggle forced quiet"
+    fi
+    exit 0 ;;
+  is-quiet)
+    m=$(modes)
+    grep -qx -e quiet -e fullscreen <<<"$m" && exit 0
+    exit 1 ;;
+  *) sed -n '2,10p' "$0"; exit 2 ;;
+esac

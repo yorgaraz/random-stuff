@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""fullscreen-watch: keep mako's "fullscreen" (quiet) mode in step with Hyprland and the games.
+
+  fullscreen-watch           run as a daemon (started by exec-once in the Hyprland config)
+  fullscreen-watch --sync    recompute once, fix the mako mode, exit (self-healing, tests)
+
+Quiet mode is ON when either is true, otherwise OFF:
+  1. a workspace a monitor shows right now holds a real fullscreen window (Hyprland state 2 or 3; 1 is maximize and does not
+     count) whose class is NOT on the everyday
+     list (fullscreen-ignore, next to this file: one case-insensitive regex per line, matched against the class);
+  2. a game runs (`gentle --game` exits 3; the answer is cached for 10 s).
+The pinned F12 quake terminal is a float, so it does not count. mako hides every notification but the
+emergency lane while the mode is on (see the mako config). It only ever adds or removes "fullscreen";
+the separate forced "quiet" mode (configs/mako/quiet) is never touched.
+
+A stuck mode would hide all notifications forever, so every failure path ends with the mode OFF:
+hyprctl missing or broken, a dead socket, an exit signal, a daemon that dies. The daemon also re-syncs
+every 30 s (this also catches a game that starts or stops without a Hyprland event), and notify-user
+runs --sync when this daemon's pidfile is stale.
+
+Env (tests): XDG_RUNTIME_DIR, HYPRLAND_INSTANCE_SIGNATURE, FULLSCREEN_WATCH_PIDFILE,
+FULLSCREEN_IGNORE_FILE (default ~/.config/mako/fullscreen-ignore), FULLSCREEN_WATCH_GENTLE (default: gentle).
+"""
+import atexit
+import json
+import os
+import re
+import select
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+MODE = "fullscreen"
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+PIDFILE = os.environ.get("FULLSCREEN_WATCH_PIDFILE") or os.path.join(RUNTIME, "mako-fullscreen-watch.pid")
+IGNORE_FILE = os.environ.get("FULLSCREEN_IGNORE_FILE") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "mako", "fullscreen-ignore")
+GAME_TTL = 10  # seconds a `gentle --game` answer is reused
+_game = (0.0, False)
+# Hyprland events that can change "a real fullscreen window is on a visible workspace".
+EVENTS = {
+    "fullscreen", "workspace", "workspacev2", "focusedmon", "focusedmonv2", "openwindow", "closewindow",
+    "movewindow", "movewindowv2", "monitoradded", "monitoraddedv2", "monitorremoved", "monitorremovedv2",
+    "activespecial", "activespecialv2", "createworkspace", "createworkspacev2", "destroyworkspace",
+    "destroyworkspacev2", "moveworkspace", "moveworkspacev2", "changefloatingmode", "configreloaded",
+}
+sig = None  # Hyprland instance signature in use
+
+
+def run(cmd, env=None):
+    """Run a command, return stdout or None on any failure (missing binary, non-zero, timeout)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def instances():
+    """Hyprland instance dirs that have an event socket, newest first."""
+    base = os.path.join(RUNTIME, "hypr")
+    try:
+        names = [n for n in os.listdir(base) if os.path.exists(os.path.join(base, n, ".socket2.sock"))]
+    except OSError:
+        return []
+    names.sort(key=lambda n: os.path.getmtime(os.path.join(base, n)), reverse=True)
+    return names
+
+
+def pick_sig():
+    """The env signature if its socket is there, else the newest instance (Hyprland may have restarted)."""
+    env = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    found = instances()
+    if env and env in found:
+        return env
+    return found[0] if found else (env or None)
+
+
+def ignore_patterns():
+    """Compiled regexes from the ignore file. Missing or unreadable file = empty list; a bad line is skipped."""
+    pats = []
+    try:
+        with open(IGNORE_FILE, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return pats
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            pats.append(re.compile(line, re.IGNORECASE))
+        except re.error:
+            pass
+    return pats
+
+
+def loud_fullscreen():
+    """True when hyprctl answered and a visible workspace holds a fullscreen window not on the everyday list.
+    None when hyprctl failed or answered nonsense (the caller then forces the mode off)."""
+    env = dict(os.environ)
+    if sig:
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = sig
+    mons = run(["hyprctl", "monitors", "-j"], env)
+    clients = run(["hyprctl", "clients", "-j"], env)
+    if mons is None or clients is None:
+        return None
+    try:
+        visible = set()
+        for m in json.loads(mons):
+            visible.add(m["activeWorkspace"]["id"])
+            special = (m.get("specialWorkspace") or {}).get("id", 0)
+            if special:
+                visible.add(special)
+        pats = ignore_patterns()
+        for c in json.loads(clients):
+            if not (c.get("fullscreen") or 0) >= 2 or not c.get("mapped", True):
+                continue
+            if c["workspace"]["id"] not in visible:
+                continue
+            cls = str(c.get("class") or "")
+            if not any(p.search(cls) for p in pats):
+                return True
+        return False
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def game_running():
+    """`gentle --game` exits 3 when a game runs. Missing gentle or any other result = no game. Cached 10 s."""
+    global _game
+    now = time.monotonic()
+    if now - _game[0] < GAME_TTL and _game[0]:
+        return _game[1]
+    try:
+        rc = subprocess.run([os.environ.get("FULLSCREEN_WATCH_GENTLE") or "gentle", "--game"],
+                            capture_output=True, timeout=5).returncode
+    except (OSError, subprocess.SubprocessError):
+        rc = 0
+    _game = (now, rc == 3)
+    return _game[1]
+
+
+def quiet_now():
+    """Should the mode be on? Any doubt about Hyprland -> False."""
+    loud = loud_fullscreen()
+    if loud is None:
+        return False
+    return loud or game_running()
+
+
+def mako_on():
+    out = run(["makoctl", "mode"])
+    return out is not None and MODE in out.split()
+
+
+def set_mode(want):
+    run(["makoctl", "mode", "-a" if want else "-r", MODE])
+
+
+def sync():
+    """Make mako's mode match reality; call makoctl only when they differ."""
+    want = quiet_now()
+    if want != mako_on():
+        set_mode(want)
+    return want
+
+
+def alive(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            return b"fullscreen-watch" in f.read()
+    except OSError:
+        return False
+
+
+def cleanup(*_):
+    set_mode(False)
+    try:
+        if open(PIDFILE).read().strip() == str(os.getpid()):
+            os.unlink(PIDFILE)
+    except (OSError, ValueError):
+        pass
+
+
+def on_signal(signum, _frame):
+    cleanup()
+    os._exit(0)
+
+
+def drain_events(s, buf):
+    """Read what is waiting on the socket; return (relevant_event_seen, buf). Raises OSError on EOF."""
+    data = s.recv(65536)
+    if not data:
+        raise OSError("event socket closed")
+    buf += data
+    relevant = False
+    while b"\n" in buf:
+        line, buf = buf.split(b"\n", 1)
+        if line.split(b">>", 1)[0].decode("utf-8", "replace") in EVENTS:
+            relevant = True
+    return relevant, buf
+
+
+def watch():
+    global sig
+    try:
+        pid = int(open(PIDFILE).read().strip())
+        if pid != os.getpid() and alive(pid):
+            return  # already running
+    except (OSError, ValueError):
+        pass
+    with open(PIDFILE, "w") as f:
+        f.write("%d\n" % os.getpid())
+    atexit.register(cleanup)
+    for s_ in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s_, on_signal)
+    try:
+        while True:
+            sig = pick_sig()
+            s = None
+            try:
+                if not sig:
+                    raise OSError("no Hyprland instance")
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(os.path.join(RUNTIME, "hypr", sig, ".socket2.sock"))
+                sync()
+                buf = b""
+                while True:
+                    ready, _, _ = select.select([s], [], [], 30)
+                    if not ready:
+                        sync()  # periodic self-heal
+                        continue
+                    relevant, buf = drain_events(s, buf)
+                    if relevant:
+                        # let a burst of events settle, then look once
+                        time.sleep(0.05)
+                        while select.select([s], [], [], 0)[0]:
+                            more, buf = drain_events(s, buf)
+                        sync()
+            except OSError:
+                set_mode(False)  # Hyprland gone or restarting: never leave notifications hidden
+                time.sleep(2)
+            finally:
+                if s:
+                    s.close()
+    finally:
+        cleanup()
+
+
+def main():
+    global sig
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--sync":
+        sig = pick_sig()
+        sync()
+        return 0
+    if len(sys.argv) > 1:
+        print("usage: fullscreen-watch [--sync]", file=sys.stderr)
+        return 2
+    watch()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

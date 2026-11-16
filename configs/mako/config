@@ -7,6 +7,10 @@ text-color=#cdd6f4
 border-color=#89b4fa
 border-size=2
 group-by=summary
+max-history=50
+# overlay = drawn above fullscreen windows. Global on purpose: one surface keeps the stack
+# overlap-free. Everything except the emergency lane is hidden by [mode=fullscreen] below anyway.
+layer=overlay
 
 on-button-left=invoke-default-action
 on-button-right=invoke-default-action
@@ -18,3 +22,41 @@ text-color=#baf2c8
 on-button-left=dismiss
 on-button-right=dismiss
 
+# --- notification lanes (sender: notify-user; mode switch: fullscreen-watch) ---
+
+# Lane 2, NEEDS YOU: a Claude session waits. Stays until handled (the hook clears it).
+[app-name=claude-needs]
+border-color=#f9e2af
+default-timeout=0
+ignore-timeout=1
+
+# Lane 3, INFO: FYI, gone after 8 s.
+[app-name=claude-info]
+border-color=#6c7086
+default-timeout=8000
+ignore-timeout=1
+
+# Lane 1, EMERGENCY (need-attention): red, thick, with a sound, never times out.
+[app-name=need-attention]
+border-color=#f38ba8
+border-size=4
+default-timeout=0
+ignore-timeout=1
+on-notify=exec paplay /usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga >/dev/null 2>&1
+
+# Quiet modes hide every notification but the emergency lane:
+#   "fullscreen" is set by fullscreen-watch (a loud fullscreen window or a game), never by hand;
+#   "quiet" is the forced mode the waybar bell toggles (configs/mako/quiet), never touched by the watcher.
+# Keep these four LAST and in this order: the later section wins, so both blanket rules come first
+# and both emergency exceptions after them, which lets the emergency lane through when either mode, or both, is on.
+[mode=fullscreen]
+invisible=1
+
+[mode=quiet]
+invisible=1
+
+[mode=fullscreen app-name=need-attention]
+invisible=0
+
+[mode=quiet app-name=need-attention]
+invisible=0

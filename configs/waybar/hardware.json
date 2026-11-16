@@ -34,6 +34,15 @@
     "on-click-right": "~/.local/bin/pcpanel ssd toggle"
   },
 
+  // forced quiet for notifications (bell): click toggles; "signal" lets the script refresh it at once
+  "custom/quiet": {
+    "exec": "~/.local/bin/quiet-mode status",
+    "return-type": "json",
+    "interval": 5,
+    "signal": 10,
+    "on-click": "~/.local/bin/quiet-mode toggle"
+  },
+
   "group/hardware": {
     "orientation": "horizontal",
     "modules": ["cpu", "memory", "disc", "temperature"]

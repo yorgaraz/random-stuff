@@ -1,0 +1,7 @@
+# fullscreen-ignore: everyday apps that run fullscreen all day. fullscreen-watch does not treat a fullscreen
+# window of one of these classes as "fullscreen", so notifications stay visible over it.
+# One case-insensitive regular expression per line, matched (searched) against the window class
+# (hyprctl clients -j, field "class"). Blank lines and lines starting with # are ignored; a bad regex is skipped.
+# An empty list (or a missing file) means every fullscreen window counts. Edits apply at the next recompute,
+# no restart needed.
+^chromium$

@@ -5,6 +5,7 @@
 #
 #   gentle [--wait] [--] <command...>   run it throttled; exit code = the command's
 #   gentle --check                      print what runs now (game? top CPU, GPU apps); exit 0 = calm, 3 = a game runs
+#   gentle --game                       quiet: prints nothing, exit 3 = a game runs, 0 = none (for scripts)
 #
 # Always: its own user cgroup scope (CPUWeight=10, MemoryHigh=40% of RAM), nice 19, ionice idle.
 # A game running: CPUWeight=1, only 8 of the cores (taskset), CARGO_BUILD_JOBS / NEXTEST_TEST_THREADS / MAKEFLAGS = 4.
@@ -38,6 +39,7 @@ check() {
 wait_flag=0
 case "${1:-}" in
   --check) check; exit $? ;;
+  --game) [ -n "$(game_pids)" ] && exit 3; exit 0 ;;
   --wait) wait_flag=1; shift ;;
   -h|--help|"") sed -n '2,12p' "$0"; exit 2 ;;
 esac

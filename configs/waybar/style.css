@@ -81,6 +81,7 @@ window#waybar.empty #window {
 #hardware,
 #clock,
 #custom-pcpanel,
+#custom-quiet,
 #custom-notification {
   background-color: @surface;
   border-radius: 999px;
@@ -188,4 +189,17 @@ label:focus {
 
 #custom-pcpanel.unknown {
   color: #ed8796;
+}
+
+#custom-quiet {
+  padding: 0 8px;
+  color: @text;
+}
+
+#custom-quiet.forced {
+  color: @red;
+}
+
+#custom-quiet.auto {
+  color: alpha(@text, 0.5);
 }

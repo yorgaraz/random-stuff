@@ -30,6 +30,7 @@
     "group/media",
     "group/hardware",
     "custom/pcpanel",
+    "custom/quiet",
     "upower",
     "clock",
     "custom/notification"
