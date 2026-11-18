@@ -3,11 +3,19 @@ Description=Sunshine self-hosted game stream host for Moonlight.
 StartLimitIntervalSec=500
 StartLimitBurst=5
 
+# Not started at login (2026-11-18: it should not run unless its tray icon shows).
+# Start: app menu "Sunshine" (~/.local/share/applications override) or `systemctl --user start sunshine`.
+# Stop: its tray icon > Quit, or `systemctl --user stop sunshine`.
+# Never `systemctl --user disable sunshine`: the package declares sunshine.service as an alias, so disable
+# deletes the ~/.config/systemd/user/sunshine.service link to this file (happened 2026-11-18).
+
 [Service]
 #Environment="DISPLAY=:1"
+# Wait (up to 30 s) for waybar's tray: Sunshine tries to make its tray icon once and never retries.
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do busctl --user status org.kde.StatusNotifierWatcher >/dev/null 2>&1 && exit 0; sleep 0.5; done; exit 0'
 ExecStart=/usr/bin/sunshine
 Restart=on-failure
 RestartSec=5s
-
-[Install]
-WantedBy=graphical-session.target
+# Back to 4K after every exit, a crash included: a crashed Sunshine never runs its app's undo
+# command (2026-11-16 19:20: hang on stream end, desktop stayed 1080p). "-" = a failure here is ignored.
+ExecStopPost=-/usr/local/bin/exit_sunshine_hyprland

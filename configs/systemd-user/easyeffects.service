@@ -1,0 +1,16 @@
+[Unit]
+Description=Easy Effects (PipeWire audio effects), restarted after a crash
+# Started by Hyprland (conf.d/20_autostart.conf). A service so it comes back by itself:
+# it crashed 2026-11-13 21:33 and 2026-11-16 18:18 (with a PipeWire crash) and stayed gone.
+After=pipewire.service pipewire-pulse.service wireplumber.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/bin/easyeffects --hide-window --service-mode
+ExecStop=-/usr/bin/easyeffects --quit
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical-session.target
