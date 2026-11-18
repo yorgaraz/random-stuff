@@ -2,7 +2,8 @@
 # notify-user: the one sender for the three notification lanes (mako config: configs/mako/config).
 #
 #   notify-user needs <session> <text>    lane 2: a session waits for the user. One notification per session
-#                                           (a repeat replaces it), one soft sound, stays until cleared
+#                                           (a repeat replaces it, silently), one soft sound when the session
+#                                           was not waiting yet, stays until cleared
 #   notify-user info <session> <text>     lane 3: FYI, small, gone after about 8 s
 #   notify-user urgent <session> <text>   lane 1: hands over to need-attention (popup + red bar + over fullscreen)
 #   notify-user clear <session>           the user answered that session: dismiss its notification, drop it
@@ -179,8 +180,8 @@ fi
 # lane 2: needs
 mkdir -p "$NEEDS" && chmod 700 "$DIR" "$NEEDS"
 key_of "$who"
-old_id="" old_why=""
-[[ -f $NEEDS/$KEY ]] && IFS=$'\t' read -r old_id _ _ _ old_why < "$NEEDS/$KEY"
+old_id="" old_why="" had_entry=0
+[[ -f $NEEDS/$KEY ]] && { had_entry=1; IFS=$'\t' read -r old_id _ _ _ old_why < "$NEEDS/$KEY"; }
 [[ ${old_id:-} =~ ^[0-9]+$ ]] || old_id=""
 new_id=$(send claude-needs normal "$old_id" "$who needs you" "$why")
 [[ $new_id =~ ^[0-9]+$ ]] || new_id=0
@@ -188,7 +189,8 @@ tmp=$(mktemp "$NEEDS/.tmp.XXXXXX") || exit 0
 tgt=$(clean "${NOTIFY_USER_TARGET:-}" 80); tgt=${tgt:--}   # "-" = unknown (tabs are IFS whitespace: an empty field would collapse)
 printf '%s\t%s\t%s\t%s\t%s\n' "$new_id" "$tgt" "$(date +%s)" "$who" "$why" > "$tmp"
 mv -f -- "$tmp" "$NEEDS/$KEY"
-# the same text again (an idle reminder) replaces the popup silently
-[[ $why == "${old_why:-}" && -n $old_id ]] || play_sound
+# Two sources raise a need (the Notification hook and fleet's watchdog): the sound plays only when the session was
+# not already waiting. A raise for a session that already waits (same or new text) updates the popup silently.
+(( had_entry )) || play_sound
 refresh
 exit 0

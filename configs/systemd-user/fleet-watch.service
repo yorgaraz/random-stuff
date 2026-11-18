@@ -1,0 +1,24 @@
+# systemd USER unit of the fleet watchdog (configs/claude/bin/fleet): brings the registered background sessions
+# back at login, restarts dead always-on ones every minute and serves the read-only API on 127.0.0.1:8377.
+# Linked by link.sh, NOT enabled or started: `systemctl --user enable --now fleet-watch` when the setup is ready.
+# A second instance exits quietly (pid file lock), so a manual `fleet watch` next to it does no harm.
+[Unit]
+Description=fleet watchdog for background Claude Code sessions
+After=default.target
+
+[Service]
+Type=simple
+# --boot only lifts the brake when the machine really booted since the last tick (the boot id differs from the one the
+# previous tick stored): a unit restart, a crash restart or a re-login on the same boot is a normal start.
+ExecStart=%h/.local/bin/fleet watch --boot
+# Stopping, restarting or crashing this unit must never take the claude daemon and the background sessions with it:
+# only the main process is signalled, and every `claude --bg` / `claude respawn` fleet starts runs in its own transient
+# scope (systemd-run --user --scope), outside this unit's cgroup.
+KillMode=process
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

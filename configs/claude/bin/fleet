@@ -1,0 +1,3560 @@
+#!/usr/bin/env python3
+"""fleet: keep long-running Claude Code sessions as background jobs, with a registry, a watchdog that
+serves a local read-only API, and tmux views per scope.
+
+  fleet sync                        refresh the registry from the Claude data files
+  fleet status [--json] [name|scope]   the registry (after a sync; --no-sync skips it)
+  fleet waiting                     sessions that wait for the user, and for what
+  fleet bg <name|scope|--all> [--force] [--dry-run] [--model M]
+                                    move pane sessions to background jobs (same id, name, model, effort)
+  fleet up [--dry-run] [--boot]     bring every registered, not-held background session back (--boot counts only on a real boot)
+  fleet hold <name> | release <name>   a held session is skipped by `up` and by the watchdog
+  fleet watch [--once] [--no-api] [--no-up]   the watchdog: a tick every minute + the API on 127.0.0.1
+  fleet view <name> [--shell]       viewer loop around `claude attach` (re-attaches after a respawn)
+  fleet stash <entry>               hide a tmux session (an entry) from the pickers, shells keep running
+  fleet stash --disable <entry> [--force]   save its layout, stop + hold its jobs, close the tmux session
+  fleet unstash <entry>             bring a stashed or disabled entry back (disabled: rebuild + resume)
+  fleet list                        entries with state, windows, Claude sessions (* = waits)
+  fleet peek [name]                 popup on the active client: one session, or a type-to-filter picker
+  fleet menu [--unstash]            the tmux bar menu (stash, disable, unstash, peek, home, list)
+  fleet reconcile [--boot]          after a tmux restore: stash marks, viewers, disabled entries stay closed
+  fleet owns <session-id>           exit 0 and print the name when fleet runs that session as a job (never for one in a pane)
+
+State (never in the repo): ${FLEET_STATE_DIR:-${XDG_STATE_HOME:-~/.local/state}/fleet}, mode 700.
+Config: ${FLEET_CONFIG:-${XDG_CONFIG_HOME:-~/.config}/fleet/scopes.conf}, lines "name role [always-on|-] [effort]".
+Other overrides: FLEET_CLAUDE_HOME, FLEET_CLAUDE, FLEET_TMUX, FLEET_NOTIFY, FLEET_PORT, FLEET_NAME_PREFIX
+(act only on names with that prefix), FLEET_INTERVAL, FLEET_POLL, FLEET_EXIT_TIMEOUT, FLEET_VERIFY_TIMEOUT,
+FLEET_BOOT_ID_FILE (default /proc/sys/kernel/random/boot_id), FLEET_PIDDOMAIN, FLEET_BOOT_SETTLE / _MAX (reconcile --boot),
+FLEET_CONV_TAIL_BYTES (cap for reading a conversation file's tail, default 4 MB), FLEET_DAEMON_LOG_BYTES.
+
+Model / effort sources, first hit wins: the last assistant record of the session's own conversation file, the statusline file
+(model) or the hook's seen/ file (effort), the job's saved flags, the config column. `fleet status` and the `bg` line show which.
+
+Conversation id: a job made by Claude's in-app "move to background" can have no conversation file under its own session id.
+Fleet resolves the real one (own file, else an earlier id, else the `continued-in` record of the pre-move file, else one file
+with the session's name record; ambiguous = unknown, never guessed), resumes THAT under the session's name, and uses
+`claude respawn` only when the own file exists. After every resume / respawn / wake it watches the daemon log for a
+`settled <job> (crashed)` line for FLEET_CRASH_WAIT seconds (default 15). FLEET_CONV_SCAN_BYTES / _FILES cap the scan.
+
+Safety rules: only the guarded sync saves the registry (read-only commands never do). A row that goes `gone` keeps the pid and
+start time it last ran as; nothing is respawned or resumed while that process is alive, and session files of another pid
+domain are never judged. The brake: rows that read as gone while their recorded process lives = a bad read, act on nothing.
+
+Every `claude` this tool starts goes through run_claude(): all CLAUDE* variables removed, cwd = the session's
+directory. `daemon`, `kill` and `purge` are never run; `stop` only by `stash --disable` and `rm` only by `fleet wake`
+(on the session's own dead job row), each through a flag with exactly one caller. Names, job text and `needs` are data: they
+are stripped of control characters and capped before they reach a terminal, tmux or a notification, and are
+never passed through a shell unquoted.
+"""
+import argparse
+import contextlib
+import fcntl
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+
+VERSION = 1
+HOME = os.path.expanduser("~")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+SID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+JOB_RE = re.compile(r"^[0-9A-Za-z]{4,16}$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,79}$")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+ROLE_RE = re.compile(r"^[A-Za-z0-9._ -]{0,40}$")
+SHELLS_RE = re.compile(r"^-?(bash|zsh|sh|dash|fish)$")
+FORBIDDEN_CLAUDE = {"daemon", "stop", "kill", "rm", "purge"}
+# the session that runs this command, read BEFORE claude_env() strips every CLAUDE* variable (a Claude tool shell has it)
+CALLER_SID = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+EXIT_REFUSED, EXIT_FAILED, EXIT_USAGE = 3, 1, 2
+
+
+# ---------------------------------------------------------------- environment / paths
+def env(name, default=""):
+    return os.environ.get(name) or default
+
+
+def state_dir():
+    d = os.environ.get("FLEET_STATE_DIR")
+    if d:
+        return d
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
+    return os.path.join(base, "fleet")
+
+
+def config_path():
+    p = os.environ.get("FLEET_CONFIG")
+    if p:
+        return p
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+    return os.path.join(base, "fleet", "scopes.conf")
+
+
+def claude_home():
+    return env("FLEET_CLAUDE_HOME", os.path.join(HOME, ".claude"))
+
+
+def proc_root():
+    return env("FLEET_PROC", "/proc")
+
+
+def tmux_bin():
+    return env("FLEET_TMUX", "/usr/bin/tmux")
+
+
+def num_env(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+def poll():
+    return num_env("FLEET_POLL", 0.5)
+
+
+# ---------------------------------------------------------------- text hygiene
+def clean(s, n=200):
+    """Data from outside: NFKC, no control / format / bidi characters, one line, capped."""
+    s = unicodedata.normalize("NFKC", "" if s is None else str(s))
+    out = []
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if ch in "\t\n\r":
+            out.append(" ")
+        elif cat[0] == "C" or cat in ("Zl", "Zp"):
+            continue
+        else:
+            out.append(ch)
+    return " ".join("".join(out).split())[:n]
+
+
+def clean_path(s, n=300):
+    """a directory path from outside: control characters out, nothing else touched (no NFKC: a compat character in a
+    real path must stay what it is, or the resume would run from the wrong directory)"""
+    s = "" if s is None else str(s)
+    return "".join(ch for ch in s if unicodedata.category(ch)[0] != "C" and ch not in "\u2028\u2029")[:n]
+
+
+def log(msg):
+    d = state_dir()
+    if not os.path.isdir(d):
+        return
+    p = os.path.join(d, "fleet.log")
+    try:
+        if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
+            os.replace(p, p + ".1")
+        with open(p, "a") as f:
+            f.write("%s %s\n" % (time.strftime("%F %T"), clean(msg, 400)))
+    except OSError:
+        pass
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def err(msg):
+    print("fleet: %s" % msg, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- files, lock, registry
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_atomic(path, data, mode=0o600):
+    """temp file + fsync + rename + fsync of the directory: a hard reset leaves the old or the new file, never a torn one"""
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    with contextlib.suppress(OSError):
+        dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+
+def ensure_state_dir():
+    d = state_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(d, 0o700)
+    return d
+
+
+@contextlib.contextmanager
+def locked():
+    d = ensure_state_dir()
+    fd = os.open(os.path.join(d, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+class RegistryCorrupt(Exception):
+    pass
+
+
+class RegistryUnreadable(RegistryCorrupt):
+    """the file exists but could not be read right now (EMFILE, EACCES, an I/O error): NOT corruption. Nothing is moved
+    aside and no recovery flag is written; the command refuses and the next call tries again."""
+
+
+class Busy(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def action_lock():
+    """One non-blocking lock for everything that starts, resumes, respawns or stops a session (up, bg, stash --disable,
+    unstash, the watchdog's restarts): a second caller does not wait, it is told."""
+    d = ensure_state_dir()
+    fd = os.open(os.path.join(d, "action.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise Busy("another fleet action is running")
+        yield
+    finally:
+        os.close(fd)
+
+
+def new_row():
+    return {"scope": "unsorted", "role": "", "always_on": False, "dir": "", "session_id": "", "job_id": "",
+            "model": "", "effort": "", "effort_at": 0, "kind": "gone", "state": "gone", "needs": "", "tmux": "", "pid": 0,
+            "hold": False, "id_history": [], "former_names": [], "restarts": [], "managed": False, "conflict": [],
+            "failed": False, "moving_until": 0, "job_row": False, "notified_needs": "", "alive_as": "",
+            "failed_notified": False, "permission_mode": "", "updated": 0,
+            # the last live process (kept when the row goes gone: a respawn is refused while it is still alive), what the
+            # row was running as then, whether a session file of another pid domain claims it, and the saved-flag gaps
+            "last_pid": 0, "last_start": "", "last_kind": "", "unknown": False, "flag_warn": [],
+            # how a job ended (set once, when the row goes gone): "reboot" (the boot id changed since it was last seen alive),
+            # "stale" (its session file was left behind with a dead pid: a crash or a kill), "clean" (the file was removed:
+            # a `claude stop` or a clean exit); and the boot id it was last seen alive under
+            "end_kind": "", "last_boot": "", "purpose": "",
+            # where model / effort came from ("conversation", "statusline", "hook", "job flags", "config") and the time of
+            # the record they were read from (epoch, 0 = unknown)
+            "model_src": "", "model_at": 0, "effort_src": "",
+            # the conversation the session really continues: its own id when projects/*/<id>.jsonl exists, else the
+            # pre-move conversation (how: "id history", "continued-in", "name record"), else "" / "unknown" (never guessed)
+            "conv_id": "", "conv_how": ""}
+
+
+def registry_path():
+    return os.path.join(state_dir(), "registry.json")
+
+
+def recovery_flag():
+    return os.path.join(state_dir(), "registry.needs-recovery")
+
+
+def backups_dir():
+    return os.path.join(state_dir(), "backups")
+
+
+def list_backups():
+    try:
+        return sorted(f for f in os.listdir(backups_dir()) if f.startswith("registry-") and f.endswith(".json"))
+    except OSError:
+        return []
+
+
+def backup_registry():
+    """a timestamped copy of the current registry; the 10 newest are kept"""
+    p = registry_path()
+    try:
+        with open(p) as f:
+            data = f.read()
+        if not isinstance(json.loads(data), dict):
+            return
+    except (OSError, ValueError):
+        return  # never keep a bad file as a backup
+    d = backups_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    name = "registry-%s.json" % time.strftime("%Y%m%d-%H%M%S")
+    n = 0
+    while os.path.exists(os.path.join(d, name)):
+        n += 1
+        name = "registry-%s-%d.json" % (time.strftime("%Y%m%d-%H%M%S"), n)
+    write_atomic(os.path.join(d, name), data)
+    write_atomic(os.path.join(d, ".last"), str(int(time.time())))
+    for old in list_backups()[:-10]:
+        with contextlib.suppress(OSError):
+            os.unlink(os.path.join(d, old))
+
+
+def hourly_backup():
+    try:
+        last = float(open(os.path.join(backups_dir(), ".last")).read().strip())
+    except (OSError, ValueError):
+        last = 0
+    if time.time() - last >= 3600:
+        backup_registry()
+
+
+def read_registry_text(p):
+    """the registry file's text; a transient read error (not a missing file) is retried, then raised as OSError"""
+    last = None
+    for i in range(3):
+        try:
+            with open(p) as f:
+                return f.read()
+        except FileNotFoundError:
+            raise
+        except OSError as e:
+            last = e
+            time.sleep(0.05 * (i + 1))
+    raise last
+
+
+def load_registry():
+    """The registry, or a fresh one when there is none. A file that exists but does not PARSE as a registry (broken JSON,
+    empty, not an object) is moved aside (registry.json.corrupt-<ts>), a recovery flag is written, and RegistryCorrupt is
+    raised: nothing may start from an empty registry over a damaged one (that would forget every hold, id and recorded
+    model). A read error that is not a parse failure (too many open files, permissions) is retried and then refused
+    as RegistryUnreadable, without touching the file."""
+    p = registry_path()
+    if os.path.exists(recovery_flag()):
+        raise RegistryCorrupt(open(recovery_flag()).read().strip() or "registry needs recovery")
+    if not os.path.exists(p):
+        return {"version": VERSION, "sessions": {}}
+    try:
+        d = json.loads(read_registry_text(p))
+        if not isinstance(d, dict) or not isinstance(d.get("sessions"), dict):
+            raise ValueError("not a registry")
+    except FileNotFoundError:
+        return {"version": VERSION, "sessions": {}}
+    except OSError as e:
+        raise RegistryUnreadable("the registry could not be read right now (%s): nothing was changed, try again" % clean(e, 80))
+    except ValueError as e:
+        aside = "%s.corrupt-%s" % (p, time.strftime("%Y%m%d-%H%M%S"))
+        with contextlib.suppress(OSError):
+            os.replace(p, aside)
+        bk = list_backups()
+        msg = ("the registry could not be read (%s); moved aside to %s. Newest backup: %s. Mutating commands refuse until you run "
+               "`fleet recover --from <file>` (a backup) or `fleet recover --fresh`." % (
+                   clean(e, 80), aside, os.path.join(backups_dir(), bk[-1]) if bk else "none"))
+        with contextlib.suppress(OSError):
+            ensure_state_dir()
+            write_atomic(recovery_flag(), msg + "\n")
+        raise RegistryCorrupt(msg)
+    for name, row in d["sessions"].items():
+        base = new_row()
+        base.update(row if isinstance(row, dict) else {})
+        d["sessions"][name] = base
+    return d
+
+
+def save_registry(reg):
+    d = ensure_state_dir()
+    hourly_backup()
+    write_atomic(registry_path(), json.dumps(reg, indent=1, sort_keys=True) + "\n")
+
+
+def begin_mutation():
+    """called first by every mutating command: refuses on a damaged registry, and keeps a backup of the good one"""
+    with locked():
+        load_registry()
+        backup_registry()
+
+
+def mutate(fn):
+    """lock, load, fn(reg), save; returns what fn returns"""
+    with locked():
+        reg = load_registry()
+        res = fn(reg)
+        save_registry(reg)
+        return res
+
+
+def load_registry_tolerant():
+    """for read-only commands: a damaged registry is reported and an empty one shown, never written"""
+    try:
+        return load_registry()
+    except RegistryCorrupt as e:
+        err("WARNING: %s" % e)
+        return {"version": VERSION, "sessions": {}}
+
+
+def load_config():
+    """Optional extras per session name: `name  role  [always-on|-]  [effort|-]  [purpose text to the end of the line]`.
+    Membership (the entry = tmux session) is derived from tmux, never configured here. The 4-column form still works.
+    `always-on` = always AVAILABLE: after a reboot or a crash the watchdog and `up` bring the session back; a retire (the
+    daemon puts an idle job to sleep after 60 min) leaves it asleep until someone wakes it (`fleet wake`)."""
+    cfg = {}
+    try:
+        with open(config_path()) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return cfg
+    for line in lines:
+        line = line.split("#", 1)[0]
+        parts = line.split(None, 4)
+        if not parts:
+            continue
+        name = parts[0]
+        role = parts[1] if len(parts) > 1 else ""
+        role = "" if role == "-" else role
+        flag = parts[2] if len(parts) > 2 else "-"
+        effort = parts[3] if len(parts) > 3 else ""
+        effort = "" if effort == "-" else effort
+        purpose = clean(parts[4], 160) if len(parts) > 4 else ""
+        if (not NAME_RE.match(name) or not ROLE_RE.match(role) or flag not in ("-", "always-on")
+                or (effort and effort not in EFFORTS)):
+            log("config: skipped a bad line")
+            continue
+        cfg[name] = {"role": role, "always_on": flag == "always-on", "effort": effort, "purpose": purpose}
+    return cfg
+
+
+def write_ids(reg):
+    """ids/<session-id>: name TAB scope TAB job-id, for the current id and the history. Rewrites the directory."""
+    d = os.path.join(ensure_state_dir(), "ids")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    want = {}
+    for name, row in reg["sessions"].items():
+        for sid in ([row["session_id"]] if row["session_id"] else []) + list(row["id_history"]) + ([row["conv_id"]] if row["conv_id"] else []):
+            if SID_RE.match(sid) and sid not in want:
+                want[sid] = "%s\t%s\t%s\n" % (name, row["scope"], row["job_id"])
+    for f in os.listdir(d):
+        if f not in want and not f.startswith("."):
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(d, f))
+    for sid, line in want.items():
+        p = os.path.join(d, sid)
+        try:
+            with open(p) as f:
+                if f.read() == line:
+                    continue
+        except OSError:
+            pass
+        write_atomic(p, line)
+
+
+# A move that is half done (the pane session was /exit-ed, the job is not up yet) leaves its resume data here, in a file of
+# its own: the row of an unmanaged pane session is dropped from the registry 180 s after it is gone, the record must outlive that.
+def moving_path():
+    return os.path.join(state_dir(), "moving.json")
+
+
+def load_moving():
+    d = read_json(moving_path())
+    out = {}
+    for name, r in (d.items() if isinstance(d, dict) else []):
+        if isinstance(r, dict) and NAME_RE.match(str(name)) and SID_RE.match(str(r.get("sid", ""))):
+            out[name] = r
+    return out
+
+
+def moving_write(d):
+    write_atomic(moving_path(), json.dumps(d, indent=1, sort_keys=True) + "\n")
+
+
+def moving_set(name, rec):
+    with locked():
+        d = load_moving()
+        d[name] = rec
+        moving_write(d)
+
+
+def moving_clear(name):
+    with locked():
+        d = load_moving()
+        if d.pop(name, None) is not None:
+            moving_write(d)
+
+
+def moving_cmd(name, rec):
+    row = {"session_id": rec["sid"], "model": rec.get("model", ""), "effort": rec.get("effort", ""),
+           "permission_mode": rec.get("mode", ""), "dir": rec.get("dir", "")}
+    return manual_cmd(row, bg_args(row, name))
+
+
+def prune_moving(src, now=None):
+    """(the caller holds the lock) drop the records of moves that finished or were given up: a live job holds the session
+    id, or a pane session holds it and the record is over an hour old (the move was abandoned, the session runs on)"""
+    now = now or time.time()
+    d = load_moving()
+    keep = {}
+    for name, r in d.items():
+        held = src.running({r["sid"]}, "")
+        if held and (held["kind"] == "job" or now - float(r.get("at", 0) or 0) > 3600):
+            continue
+        keep[name] = r
+    if keep != d:
+        with contextlib.suppress(OSError):
+            moving_write(keep)
+
+
+# ---------------------------------------------------------------- reading the Claude data files
+def proc_alive(pid, procstart=None):
+    p = os.path.join(proc_root(), str(pid))
+    if not os.path.isdir(p):
+        return False
+    try:
+        with open(p + "/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return True
+    if fields and fields[0] in ("Z", "X"):
+        return False  # a zombie is gone for our purposes
+    if procstart and len(fields) > 19:
+        return fields[19] == str(procstart)
+    return True
+
+
+def ppid_of(pid):
+    try:
+        with open(os.path.join(proc_root(), str(pid), "stat")) as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def is_descendant(pid, ancestor):
+    p = pid
+    for _ in range(40):
+        if p == ancestor:
+            return True
+        if p <= 1:
+            return False
+        p = ppid_of(p)
+    return False
+
+
+def cmdline_permission_mode(pid):
+    """The permission mode a process was started with (--permission-mode X, --dangerously-skip-permissions), or "".
+    A mode changed inside the session (shift+tab) cannot be read."""
+    try:
+        with open(os.path.join(proc_root(), str(pid), "cmdline"), "rb") as f:
+            args = f.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return ""
+    for i, a in enumerate(args):
+        m = None
+        if a == "--permission-mode" and i + 1 < len(args):
+            m = args[i + 1]
+        elif a.startswith("--permission-mode="):
+            m = a.split("=", 1)[1]
+        elif a == "--dangerously-skip-permissions":
+            m = "bypassPermissions"
+        if m is not None:
+            return m if re.match(r"^[A-Za-z]{2,24}$", m) else ""
+    return ""
+
+
+def local_domain():
+    """The pidDomain Claude writes into its session files for THIS machine and pid namespace
+    ("linux:<machine id>:pid:[<namespace inode>]"), or "" when it cannot be worked out (then no file is judged foreign).
+    FLEET_PIDDOMAIN overrides it (tests)."""
+    v = os.environ.get("FLEET_PIDDOMAIN")
+    if v:
+        return v
+    try:
+        with open("/etc/machine-id") as f:
+            mid = f.read().strip()
+        ns = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return ""
+    return "linux:%s:%s" % (mid, ns) if mid and ns.startswith("pid:") else ""
+
+
+def boot_id_file():
+    return env("FLEET_BOOT_ID_FILE", "/proc/sys/kernel/random/boot_id")
+
+
+def current_boot_id():
+    try:
+        with open(boot_id_file()) as f:
+            v = f.read().strip()
+    except OSError:
+        return ""
+    return v if re.match(r"^[0-9A-Za-z-]{8,64}$", v) else ""
+
+
+def recorded_alive(row):
+    """True while the process this row was last seen running as (pid + start time) is still there. A row that reads as
+    `gone` while this is true is a bad read of the Claude data, never a death: it is not respawned or resumed."""
+    pid = row.get("last_pid") or 0
+    return bool(pid) and proc_alive(pid, row.get("last_start") or None)
+
+
+def parse_iso(t):
+    """epoch seconds of an ISO-8601 time like 2026-11-16T17:26:30.144Z, or 0"""
+    try:
+        import calendar
+        return calendar.timegm(time.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
+def conv_tail(path, sid):
+    cap = max(65536, int(num_env("FLEET_CONV_TAIL_BYTES", 4 * 1024 * 1024)))
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            win = 65536
+            while True:
+                win = min(win, cap, size)
+                f.seek(size - win)
+                data = f.read(win)
+                lines = data.split(b"\n")
+                if win < size:
+                    lines = lines[1:]  # the first line of a window is cut
+                for line in reversed(lines):
+                    if b'"assistant"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue  # a truncated or garbled line
+                    r = conv_record(d, sid)
+                    if r:
+                        return r
+                if win >= cap or win >= size:
+                    return None
+                win *= 4
+    except OSError:
+        return None
+
+
+def conv_record(d, sid):
+    if not isinstance(d, dict) or d.get("type") != "assistant" or d.get("isSidechain") is True or d.get("isApiErrorMessage") is True:
+        return None
+    if d.get("sessionId") not in (None, sid):
+        return None
+    msg = d.get("message")
+    m = msg.get("model") if isinstance(msg, dict) else None
+    m = m if isinstance(m, str) and m != "default" and MODEL_RE.match(m) else ""
+    e = next((x for x in (d.get("effort"), d.get("perTurnEffort")) if isinstance(x, str) and x in EFFORTS), "")
+    if not m:
+        return None  # a record without a usable model (<synthetic>, ...) is not the session's turn
+    return {"model": m, "effort": e, "at": parse_iso(d.get("timestamp"))}
+
+
+class Sources:
+    """The Claude data sources (read only) plus the hook's seen/ files. `all_live` = every live process whatever its
+    name (liveness is judged by session id / job id, never by name); `live` = the ones fleet can track (usable
+    name); `untracked` = live but nameless or with a name fleet cannot pass safely; `foreign` = (session id, job id) of
+    session files written in another pid domain: their pids mean nothing here, so they are never judged."""
+
+    def __init__(self):
+        home = claude_home()
+        self.all_live, self.live, self.untracked, self.foreign, self.stale = [], [], [], [], []
+        self._conv, self._cpath, self._cscan = {}, {}, {}
+        dom = local_domain()
+        for f in sorted(glob.glob(os.path.join(home, "sessions", "*.json"))):
+            d = read_json(f)
+            if not isinstance(d, dict):
+                continue
+            if dom and d.get("pidDomain") and d.get("pidDomain") != dom:
+                self.foreign.append((str(d.get("sessionId") or ""), str(d.get("jobId") or "")))
+                continue
+            try:
+                pid = int(d.get("pid"))
+            except (TypeError, ValueError):
+                continue
+            if d.get("kind") not in ("interactive", "bg"):
+                continue
+            name = clean(d.get("name"), 80)
+            sid = str(d.get("sessionId") or "")
+            if not SID_RE.match(sid):
+                continue
+            job = str(d.get("jobId") or "")
+            if not proc_alive(pid, d.get("procStart")):
+                self.stale.append((sid, job if JOB_RE.match(job) else "", pid))  # left behind by a crash, a kill or a reboot
+                continue
+            rec = {
+                "perm": cmdline_permission_mode(pid),
+                "pid": pid, "name": name, "sid": sid, "dir": clean_path(d.get("cwd")),
+                "kind": "job" if d.get("kind") == "bg" else "pane",
+                "status": clean(d.get("status"), 20), "tmux": clean(d.get("tmux"), 80),
+                "job": job if JOB_RE.match(job) else "", "waiting": clean(d.get("waitingFor"), 200),
+                "sock": clean_path(d.get("messagingSocketPath")),
+                "procstart": str(d.get("procStart") or "")}
+            rec["tracked"] = bool(name) and name != sid[:8] and bool(NAME_RE.match(name))
+            self.all_live.append(rec)
+            (self.live if rec["tracked"] else self.untracked).append(rec)
+        self.jobs = {}
+        for f in glob.glob(os.path.join(home, "jobs", "*", "state.json")):
+            jid = os.path.basename(os.path.dirname(f))
+            d = read_json(f)
+            if not isinstance(d, dict) or not JOB_RE.match(jid):
+                continue
+            name = clean(d.get("name"), 80)
+            flags = d.get("respawnFlags") if isinstance(d.get("respawnFlags"), list) else []
+            self.jobs[jid] = {
+                "id": jid, "name": name, "sid": str(d.get("sessionId") or ""), "state": clean(d.get("state"), 20),
+                "needs": "" if str(d.get("needs") or "").startswith("send a prompt to start") else clean(d.get("needs"), 240),
+                "dir": clean_path(d.get("cwd")),
+                "created": str(d.get("createdAt") or ""), "flags": [str(x) for x in flags]}
+
+    def running(self, sids=(), job=""):
+        """a live process (any name) that holds one of these session ids or this job id, or None"""
+        sids = {x for x in sids if x}
+        for r in self.all_live:
+            if r["sid"] in sids or (job and r["job"] == job):
+                return r
+        return None
+
+    def conv_path(self, sid):
+        """the newest projects/*/<sid>.jsonl, or None"""
+        if not SID_RE.match(sid or ""):
+            return None
+        if sid not in self._cpath:
+            paths = glob.glob(os.path.join(claude_home(), "projects", "*", "%s.jsonl" % sid))
+            self._cpath[sid] = max(paths, key=lambda p: os.path.getmtime(p)) if paths else None
+        return self._cpath[sid]
+
+    def conv_dir_scan(self, d):
+        """[{id, mtime, cont: [ids it was continued in], name}] for the newest conversation files of a project directory.
+        Only the TAIL of each file is read (FLEET_CONV_SCAN_BYTES, default 512 KB; at most FLEET_CONV_SCAN_FILES = 40 files):
+        the pre-move file ends with a `continued-in` record, and its agent-name / custom-title records repeat."""
+        if d in self._cscan:
+            return self._cscan[d]
+        out = []
+        cap = max(4096, int(num_env("FLEET_CONV_SCAN_BYTES", 512 * 1024)))
+        try:
+            files = sorted(glob.glob(os.path.join(d, "*.jsonl")), key=os.path.getmtime, reverse=True)[:int(num_env("FLEET_CONV_SCAN_FILES", 40))]
+        except OSError:
+            files = []
+        for f in files:
+            fid = os.path.basename(f)[:-6]
+            if not SID_RE.match(fid):
+                continue
+            try:
+                with open(f, "rb") as fh:
+                    fh.seek(0, 2)
+                    size = fh.tell()
+                    fh.seek(max(0, size - cap))
+                    data = fh.read().decode("utf-8", "replace")
+                mt = os.path.getmtime(f)
+            except OSError:
+                continue
+            cont = re.findall(r'"continuedInSessionId":\s*"([0-9a-fA-F-]{36})"', data)
+            names = re.findall(r'"(?:agentName|customTitle)":\s*"([^"\\]{1,80})"', data)
+            out.append({"id": fid, "mtime": mt, "cont": cont, "name": names[-1] if names else ""})
+        self._cscan[d] = out
+        return out
+
+    def conversation(self, sid):
+        """{"model", "effort", "at"} from the last usable assistant record of the session's own conversation file, or None.
+        Real files (checked: 121 files, ~14000 assistant records): every assistant record has `effort` (and `perTurnEffort`;
+        where both exist they were never different, older records carry only one of them, so `effort` first, then
+        `perTurnEffort`) and message.model. The file is read from the END in growing windows (64 KB ... FLEET_CONV_TAIL_BYTES,
+        default 4 MB: these files reach hundreds of MB), never whole. Records of another session id, sidechains, API errors and
+        `<synthetic>` models are skipped; a truncated last line is just a line that does not parse. Every value is checked
+        against EFFORTS / MODEL_RE; nothing usable = None and the next source is used."""
+        if not SID_RE.match(sid or ""):
+            return None
+        if sid in self._conv:
+            return self._conv[sid]
+        res = None
+        path = self.conv_path(sid)
+        if path:
+            res = conv_tail(path, sid)
+        self._conv[sid] = res
+        return res
+
+    def model(self, sid):
+        d = read_json(os.path.join(claude_home(), "statusline-sessions", "%s.json" % sid)) if SID_RE.match(sid) else None
+        m = d.get("model") if isinstance(d, dict) else None
+        return m if isinstance(m, str) and m != "default" and MODEL_RE.match(m) else ""
+
+    def effort(self, sid):
+        """(level, epoch it was recorded) from the hook's seen/<sid>, or ("", 0)"""
+        if not SID_RE.match(sid):
+            return "", 0
+        try:
+            with open(os.path.join(state_dir(), "seen", sid)) as f:
+                parts = f.readline().rstrip("\n").split("\t")
+        except OSError:
+            return "", 0
+        e = parts[1] if len(parts) > 1 else ""
+        try:
+            at = int(parts[0])
+        except (ValueError, IndexError):
+            at = 0
+        return (e, at) if e in EFFORTS else ("", 0)
+
+
+def flag_value(flags, key):
+    for i, f in enumerate(flags[:-1]):
+        if f == key:
+            return flags[i + 1]
+    return ""
+
+
+# ---------------------------------------------------------------- tmux snapshot, entries
+# Entry = a tmux session. Its members are every window in it (with or without Claude), derived from tmux on every
+# call, never configured. Marks and layouts that must survive a reboot live in fleet state (entries.json).
+SNAP_FMT = ("#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_current_command}"
+            "\t#{pane_current_path}\t#{@fleet-view}\t#{@fleet-stashed}\t#{pane_pid}")
+VIEW_STALE = 60  # a tagged pane that shows a bare shell for this long is a dead viewer, not a starting one
+
+
+def skip_re():
+    v = os.environ.get("FLEET_SKIP", "^rcterm-")
+    return re.compile(v) if v else None
+
+
+def tmux_snapshot():
+    """One `list-panes -a`: {"panes": [...]} or None when tmux does not answer."""
+    rc, out = tm("list-panes", "-a", "-F", SNAP_FMT)
+    if rc != 0:
+        return None
+    skip = skip_re()
+    panes = []
+    for line in out.splitlines():
+        f = line.split("\t")
+        if len(f) != 10:
+            continue
+        sess, wid, widx, wname, pane, cmd, cwd, tag, stashed, ppid = f
+        if (skip and skip.search(sess)) or clean(sess, 80) != sess or not sess:
+            continue
+        panes.append({"session": sess, "window": wid, "index": widx, "wname": clean(wname, 60), "pane": pane,
+                      "cmd": clean(cmd, 40), "cwd": clean_path(cwd), "tag": tag, "stashed": stashed not in ("", "0"),
+                      "pid": int(ppid) if ppid.isdigit() else 0})
+    return {"panes": panes}
+
+
+def classify(p, now=None):
+    """('viewer', name) | ('stale', name) | ('shell', '') | ('other', '') for one pane. The per-pane tag
+    (`@fleet-view` = "<name> <epoch> [<viewer pid>]", set at creation and by `fleet view` itself) is trusted, not the
+    command name: a freshly created viewer still shows its shell. 'stale' = tagged, bare shell, older than a minute and
+    the recorded viewer process is dead: the only pane fleet may ever respawn."""
+    now = now or time.time()
+    shell = bool(SHELLS_RE.match(p["cmd"]))
+    parts = p["tag"].split(" ")
+    if p["tag"] and NAME_RE.match(parts[0]):
+        try:
+            age = now - float(parts[1])
+        except (IndexError, ValueError):
+            age = VIEW_STALE + 1
+        vpid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        if shell and age >= VIEW_STALE and not (vpid and proc_alive(vpid)):
+            return "stale", parts[0]
+        return "viewer", parts[0]
+    return ("shell", "") if shell else ("other", "")
+
+
+def viewer_alive(p, now=None):
+    """a tagged pane counts as a viewer only while the viewer process recorded in its tag is alive; a tag without a pid yet
+    (a viewer that has just been created and has not filled it in) counts for VIEW_STALE seconds"""
+    now = now or time.time()
+    parts = p["tag"].split(" ")
+    if not (p["tag"] and NAME_RE.match(parts[0])):
+        return False
+    vpid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    if vpid:
+        return proc_alive(vpid)
+    try:
+        return now - float(parts[1]) < VIEW_STALE
+    except (IndexError, ValueError):
+        return False
+
+
+def entries_path():
+    return os.path.join(state_dir(), "entries.json")
+
+
+def load_entries():
+    d = read_json(entries_path())
+    d = d if isinstance(d, dict) else {}
+    for k in ("stashed", "disabled"):
+        if not isinstance(d.get(k), dict):
+            d[k] = {}
+    return d
+
+
+def save_entries(d):
+    write_atomic(entries_path(), json.dumps(d, indent=1, sort_keys=True) + "\n")
+
+
+def entries_mutate(fn):
+    with locked():
+        d = load_entries()
+        res = fn(d)
+        save_entries(d)
+        return res
+
+
+def derive_entry(name, row, cur, snap, ent):
+    """The entry (tmux session) a Claude session belongs to: the session of the pane it runs in, else of the window
+    that views it, else the disabled entry that remembers it. tmux not answering: keep what we knew."""
+    if snap is None:
+        return row["scope"]
+    if cur and cur["kind"] == "pane":
+        m = re.search(r"%(\d+)$", cur["tmux"])
+        for p in snap["panes"]:  # the pane id alone is not enough: another tmux server has its own %1; the process must sit in it
+            if m and p["pane"] == "%" + m.group(1) and p["pid"] and is_descendant(cur["pid"], p["pid"]):
+                return p["session"]
+    for p in sorted(snap["panes"], key=lambda p: p["session"]):
+        kind, vname = classify(p)
+        if kind in ("viewer", "stale") and vname == name:
+            return p["session"]
+    for p in snap["panes"]:  # restored after a reboot: a bare shell named after it, in the entry it had, is its viewer-to-be
+        if p["session"] == row["scope"] and p["wname"] == name and classify(p)[0] == "shell":
+            return p["session"]
+    for e, d in sorted(ent["disabled"].items()):
+        if any(w.get("session") == name for w in d.get("windows", [])):
+            return e
+    return "unsorted"
+
+
+CONV_KNOWN = ("own", "id history", "continued-in", "name record")
+
+
+def project_slug(path):
+    """the directory name Claude gives a working directory under projects/ (every non-alphanumeric character becomes -)"""
+    return re.sub(r"[^A-Za-z0-9]", "-", path or "")
+
+
+def resolve_conv(src, row, name, created=0):
+    """(conversation id, how). A job made by Claude's in-app "move to background" can have NO conversation file under its
+    own session id (the daemon then fails with `source session <id> not found`): the history is in the PRE-MOVE file. Order:
+    1. the session id itself has a file (own); 2. what was resolved before, while its file still exists; 3. an earlier id of
+    this row (id_history) has a file; 4. a file of the same project directory whose tail carries a `continued-in` record naming
+    one of the row's ids (exact: Claude wrote it at the move); 5. exactly one file of that directory, written after the job
+    was created, whose agent-name / custom-title is the session name. Two candidates or none = ("", "unknown"): never guessed."""
+    sid = row["session_id"]
+    if not SID_RE.match(sid or ""):
+        return "", ""
+    if src.conv_path(sid):
+        return sid, "own"
+    prev = row.get("conv_id") or ""
+    if prev and prev != sid and row.get("conv_how") in CONV_KNOWN[1:] and src.conv_path(prev):
+        return prev, row["conv_how"]
+    for h in row["id_history"]:
+        if src.conv_path(h):
+            return h, "id history"
+    d = os.path.join(claude_home(), "projects", project_slug(row.get("dir")))
+    if not row.get("dir") or not os.path.isdir(d):
+        return "", "unknown"
+    ids = {sid, *row["id_history"]} - {""}
+    ptr = sorted({f["id"] for f in src.conv_dir_scan(d) if f["id"] != sid and ids & set(f["cont"])})
+    if len(ptr) == 1:
+        return ptr[0], "continued-in"
+    if len(ptr) > 1:
+        return "", "unknown"
+    cands = sorted(f["id"] for f in src.conv_dir_scan(d) if f["id"] != sid and name and f["name"] == name and f["mtime"] >= created and not f["cont"])
+    if len(cands) == 1:
+        return cands[0], "name record"
+    return "", "unknown"
+
+
+SYNC_STATS = {}
+
+
+def sync_registry(reg, config, src, now, snap=None, ent=None):
+    """Pure step: merge the Claude data into the registry (in place)."""
+    sess = reg["sessions"]
+    ent = ent or {"stashed": {}, "disabled": {}}
+    # `went` = every row that was running (job or pane) at the last save and reads as gone now, with the process it last
+    # ran as: the brake tells a real death (that process is gone) from a bad read (it is still alive)
+    stats = {"went": [], "foreign": len(src.foreign),
+             "untracked": [(r["name"] or "(no name)", r["sid"][:8], r["kind"]) for r in src.untracked]}
+    boot_now = current_boot_id()
+    foreign_sids = {a for a, b in src.foreign if a}
+    foreign_jobs = {b for a, b in src.foreign if b}
+    SYNC_STATS.clear()
+    SYNC_STATS.update(stats)
+    # identity is the session id (plus id_history and job id), never the name: a rename in place moves the row
+    for oname in list(sess):
+        orow = sess[oname]
+        orow["alive_as"] = ""
+        ids = {orow["session_id"], *orow["id_history"]} - {""}
+        for rec in src.all_live:
+            if not (rec["sid"] in ids or (orow["job_id"] and rec["job"] == orow["job_id"])) or rec["name"] == oname:
+                continue
+            if rec["tracked"] and (rec["name"] not in sess or sess[rec["name"]]["session_id"] in ("", rec["sid"])):
+                moved = sess.pop(oname)
+                if rec["name"] in sess:
+                    base = sess.pop(rec["name"])
+                    base.update({k: v for k, v in moved.items() if k not in ("role", "always_on")})
+                    moved = base
+                moved["former_names"] = ([oname] + [x for x in moved["former_names"] if x != oname])[:5]
+                sess[rec["name"]] = moved
+                break
+            orow["alive_as"] = rec["name"] or rec["sid"][:8]  # alive under a name fleet cannot use (or a clashing one)
+    live_by = {}
+    for r in src.live:
+        live_by.setdefault(r["name"], []).append(r)
+    jobs_by = {}
+    for j in src.jobs.values():
+        jobs_by.setdefault(j["name"], []).append(j)
+    for name in sorted(set(config) | set(sess) | set(live_by)):
+        row = sess.setdefault(name, new_row())
+        prev_kind = row["kind"]
+        cfg = config.get(name)
+        row["role"] = cfg["role"] if cfg else ""
+        row["purpose"] = cfg["purpose"] if cfg else ""
+        row["always_on"] = bool(cfg and cfg["always_on"])
+        live = live_by.get(name, [])
+        sids = sorted({r["sid"] for r in live})
+        row["conflict"] = sids if len(sids) > 1 else []
+        if row["conflict"]:
+            row["state"] = "conflict"
+            row["kind"] = "conflict"
+            row["needs"] = ""
+            row["updated"] = now
+            continue
+        cur = None
+        if live:  # a bg process wins over a pane process holding the same session
+            cur = sorted(live, key=lambda r: r["kind"] != "job")[0]
+        if not cur and row["alive_as"]:
+            other = src.running({row["session_id"], *row["id_history"]}, row["job_id"])
+            row["kind"] = "untracked"
+            row["state"] = (other["status"] if other else "") or "untracked"
+            row["updated"] = now
+            continue
+        row["scope"] = derive_entry(name, row, cur, snap, ent)
+        sid = cur["sid"] if cur else ""
+        cand = jobs_by.get(name, [])
+        jrow = None
+        for pref in (lambda j: sid and j["sid"] == sid, lambda j: j["sid"] == row["session_id"], lambda j: True):
+            pick = sorted([j for j in cand if pref(j)], key=lambda j: j["created"], reverse=True)
+            if pick:
+                jrow = pick[0]
+                break
+        if not (cur or cfg or row["managed"]):
+            jrow = None  # a stale job row of an unrelated name is not ours
+        if jrow and cur and cur["kind"] == "pane" and jrow["sid"] != sid:
+            jrow = None
+        if not sid and jrow:
+            sid = jrow["sid"]
+        if sid and sid != row["session_id"]:
+            if row["session_id"] and row["session_id"] not in row["id_history"]:
+                row["id_history"].insert(0, row["session_id"])
+            row["id_history"] = [x for x in row["id_history"] if x != sid][:20]
+            row["session_id"] = sid
+        row["kind"] = cur["kind"] if cur else "gone"
+        row["unknown"] = bool(not cur and ((row_ids(row) & foreign_sids) or (row["job_id"] and row["job_id"] in foreign_jobs)))
+        if cur:
+            row["last_pid"], row["last_start"], row["last_kind"] = cur["pid"], cur["procstart"], cur["kind"]
+            row["last_boot"], row["end_kind"] = boot_now, ""
+        elif prev_kind in ("job", "pane"):
+            if row["last_boot"] and boot_now and row["last_boot"] != boot_now:
+                row["end_kind"] = "reboot"
+            elif row["job_id"] and daemon_end(row["job_id"]) == "retired":
+                row["end_kind"] = "retired"  # the daemon put an idle job to sleep: not a crash, not a stop
+            elif any(a in row_ids(row) or (b and b == row["job_id"]) for a, b, _ in src.stale):
+                row["end_kind"] = "stale"
+            else:
+                row["end_kind"] = "clean"
+            SYNC_STATS["went"].append({"name": name, "kind": prev_kind, "pid": row["last_pid"], "start": row["last_start"],
+                                       "unknown": row["unknown"]})
+        row["pid"] = cur["pid"] if cur else 0
+        row["tmux"] = cur["tmux"] if cur and cur["kind"] == "pane" else ""
+        if cur and cur["kind"] == "job" and cur["job"]:
+            row["job_id"] = cur["job"]
+        elif jrow:
+            row["job_id"] = jrow["id"]
+        row["job_row"] = bool(jrow)
+        row["flag_warn"] = [k for k in ("--model", "--effort") if jrow and not flag_value(jrow["flags"], k)]
+        if cur and cur["kind"] == "job" or jrow:
+            row["managed"] = True
+        d = (cur and cur["dir"]) or (jrow and jrow["dir"]) or row["dir"]
+        row["dir"] = d
+        row["state"] = (cur["status"] if cur else (jrow["state"] if jrow else "gone")) or "gone"
+        if row["kind"] == "job" and jrow and jrow["needs"]:
+            row["needs"] = jrow["needs"]
+        elif cur and cur["status"] == "waiting":
+            row["needs"] = cur["waiting"] or "waiting"
+        else:
+            row["needs"] = ""
+        sids_known = [row["session_id"]] + row["id_history"]
+        created = parse_iso(jrow["created"]) if jrow else 0
+        row["conv_id"], row["conv_how"] = resolve_conv(src, row, name, created)
+        conv = src.conversation(row["conv_id"])  # the FIRST source: the last assistant record of the session's resolved conversation file
+        m, msrc, mat = (conv["model"], "conversation", conv["at"]) if conv and conv["model"] else ("", "", 0)
+        if not m:
+            m = next((x for x in (src.model(s) for s in sids_known) if x), "")
+            msrc, mat = ("statusline", 0) if m else ("", 0)
+        if not m and jrow:
+            m = flag_value(jrow["flags"], "--model")
+            msrc = "job flags" if m else ""
+        if m and MODEL_RE.match(m):
+            row["model"], row["model_src"], row["model_at"] = m, msrc, mat
+        e, eat = (conv["effort"], conv["at"]) if conv and conv["effort"] else ("", 0)
+        esrc = "conversation" if e else ""
+        if not e:
+            e, eat = next(((x, t) for x, t in (src.effort(s) for s in sids_known) if x), ("", 0))
+            esrc = "hook" if e else ""
+        if not e:
+            e = flag_value(jrow["flags"], "--effort") if jrow else ""
+            esrc, eat = ("job flags", 0) if e else ("", 0)
+        if not e and cfg and cfg["effort"]:
+            e = cfg["effort"]  # the optional config column: only when nothing was recorded
+            esrc, eat = "config", 0
+        if e in EFFORTS:
+            row["effort"], row["effort_at"], row["effort_src"] = e, eat, esrc
+        pm = (flag_value(jrow["flags"], "--permission-mode") if jrow else "") or \
+            (cur["perm"] if cur and cur["kind"] == "pane" else "")
+        if pm and re.match(r"^[A-Za-z]{2,24}$", pm):
+            row["permission_mode"] = pm
+        if row["kind"] != "gone":
+            row["failed"] = False
+            row["failed_notified"] = False
+        elif row["failed"]:
+            row["state"] = "failed"
+        row["updated"] = now
+    for name in list(sess):  # drop what was never ours and is gone
+        r = sess[name]
+        if name not in config and r["kind"] == "gone" and not r["managed"] and r["moving_until"] <= now:
+            del sess[name]  # (a row being moved by `bg` is never dropped under it)
+    return reg
+
+
+BRAKE = {"why": ""}
+
+
+def do_sync(save=True):
+    """Sync the registry from the Claude data and tmux. save=False (read-only commands): never writes, and a damaged
+    registry is reported and shown empty instead of refusing. save=True is the GUARDED sync (sync_guarded): the brake
+    decides whether the result may be written; when it says no, the in-memory registry is returned unsaved and
+    BRAKE["why"] holds the reason. No other code path writes a registry that was just synced."""
+    if not save:
+        reg = load_registry_tolerant()
+        sync_registry(reg, load_config(), Sources(), int(time.time()), tmux_snapshot(), load_entries())
+        BRAKE["why"] = brake_reason()
+        return reg
+    reg, why = sync_guarded()
+    BRAKE["why"] = why
+    if why:
+        log("brake: %s: not saved" % why)
+    return reg
+
+
+def sync_ro():
+    """sync for read-only commands: never saves; a damaged registry is reported (stderr) and an empty one shown, never a refusal"""
+    return do_sync(save=False)
+
+
+def sync_guarded(exempt=False):
+    """Sync in memory first; the brake decides whether it may be SAVED. A bad read of the Claude data must not be written
+    down as "everything died" (the next tick would then respawn it all). Returns (registry, brake reason or '').
+    exempt = a real boot (see real_boot()): the brake is skipped."""
+    with locked():
+        reg = load_registry()
+        src = Sources()
+        sync_registry(reg, load_config(), src, int(time.time()), tmux_snapshot(), load_entries())
+        why = brake_reason()
+        if why and not exempt:
+            return reg, why
+        save_registry(reg)
+        write_ids(reg)
+        prune_moving(src)
+        return reg, ""
+
+
+# ---------------------------------------------------------------- claude / tmux calls
+def claude_env():
+    return {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+
+
+def run_claude(args, cwd=None, capture=True, timeout=None, stop_ok=False, rm_ok=False):
+    """The one place that starts `claude`. Two narrow exceptions, each with exactly one caller: `stop` for the disable path
+    (stop_ok=True) and `rm` for `fleet wake` on the session's OWN job row (rm_ok=True); daemon, kill and purge never."""
+    if not args or args[0] in FORBIDDEN_CLAUDE - ({"stop"} if stop_ok else set()) - ({"rm"} if rm_ok else set()):
+        raise RuntimeError("fleet never runs `claude %s`" % (args[0] if args else ""))
+    timeout = timeout or num_env("FLEET_CLAUDE_TIMEOUT", 60)
+    cmd = [env("FLEET_CLAUDE", "claude")] + [str(a) for a in args]
+    sr = env("FLEET_SYSTEMD_RUN", "systemd-run")
+    if args[0] in ("--bg", "respawn") and (os.environ.get("INVOCATION_ID") or os.environ.get("FLEET_FORCE_SYSTEMD")) and shutil.which(sr):
+        # Under systemd (the fleet-watch service) the claude daemon is started on demand by these calls and would become
+        # part of THIS unit's cgroup: stopping or restarting the unit would then kill every background session. A
+        # transient scope of its own keeps the daemon and the jobs out of the unit's cgroup.
+        cmd = [sr, "--user", "--scope", "--quiet", "--collect", "--description=fleet: claude background session", "--"] + cmd
+    if cwd and not os.path.isdir(cwd):
+        return 127, "directory is gone: %s" % clean(cwd, 200)
+    try:
+        if capture:
+            p = subprocess.run(cmd, cwd=cwd or None, env=claude_env(), stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=timeout)
+            return p.returncode, clean((p.stdout or "") + " " + (p.stderr or ""), 400)
+        # foreground (a viewer on the terminal): Ctrl+Z inside `claude attach` stops the client instead of ending
+        # it, so wait with WUNTRACED; a stopped client is ended and reported as "stopped" (a deliberate detach)
+        proc = subprocess.Popen(cmd, cwd=cwd or None, env=claude_env())
+        while True:
+            try:
+                _, status = os.waitpid(proc.pid, os.WUNTRACED)
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                proc.returncode = 0
+                return 0, ""
+            if os.WIFSTOPPED(status):
+                for sig in (signal.SIGCONT, signal.SIGTERM):
+                    with contextlib.suppress(OSError):
+                        os.kill(proc.pid, sig)
+                time.sleep(0.5)
+                with contextlib.suppress(OSError):
+                    os.kill(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(ChildProcessError, OSError):
+                    os.waitpid(proc.pid, 0)
+                proc.returncode = 0
+                return 0, "stopped"
+            proc.returncode = os.waitstatus_to_exitcode(status)
+            return proc.returncode, ""
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+    except OSError as e:
+        return 127, clean(e, 200)
+
+
+def tm(*args):
+    try:
+        p = subprocess.run([tmux_bin()] + [str(a) for a in args], capture_output=True, text=True, timeout=15)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+def guard(name):
+    """FLEET_NAME_PREFIX: act only on names with that prefix (a safety net for live tests)."""
+    pre = os.environ.get("FLEET_NAME_PREFIX", "")
+    return not pre or name.startswith(pre)
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def composer_state(text):
+    """EMPTY | DRAFT | UNKNOWN from a `capture-pane -p -e` dump: the prompt box is the block between the last
+    two horizontal rules; a dim placeholder is ignored."""
+    lines = text.split("\n")
+    while lines and not ANSI_RE.sub("", lines[-1]).strip():
+        lines.pop()
+    r1 = r2 = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if ANSI_RE.sub("", lines[i]).startswith("─" * 10):
+            if r2 < 0:
+                r2 = i
+            else:
+                r1 = i
+                break
+    if r1 < 0 or r2 - r1 < 2:
+        return "UNKNOWN"
+    body = ""
+    for l in lines[r1 + 1:r2]:
+        l = re.sub(r"\x1b\[2m.*$", "", l)
+        l = ANSI_RE.sub("", l)
+        if l.startswith("❯"):
+            l = l[1:]
+        body += re.sub(r"[\s ]", "", l)
+    return "DRAFT" if body else "EMPTY"
+
+
+def resume_id(row):
+    """the conversation to resume: the resolved conversation id (own, or the pre-move one). An UNRESOLVED session
+    (conv_how "unknown") gives a placeholder, for a manual command only: every caller refuses before it would run it
+    (conv_ok / conv_refusal)."""
+    if row.get("conv_how") == "unknown":
+        return "<CONVERSATION-ID>"
+    return row.get("conv_id") or row["session_id"]
+
+
+def conv_ok(row):
+    return row.get("conv_how") in CONV_KNOWN
+
+
+def conv_refusal(name, row):
+    """why a session is not resumed when its conversation file cannot be found, with the exact manual command"""
+    d = os.path.join(claude_home(), "projects", project_slug(row.get("dir")))
+    return ("no conversation file found for session %s (its own id has none, and no earlier id, `continued-in` record or single "
+            "name record points at one): not resumed, never guessed. Find the real conversation id with: "
+            "grep -l '\"continuedInSessionId\":\"%s\"' %s/*.jsonl ; then, filling in the <...> part: %s" % (
+                (row["session_id"] or "?")[:8], row["session_id"], shlex.quote(d), manual_cmd(row, bg_args(row, name))))
+
+
+def bg_args(row, name, model=None, effort=None, perm=None):
+    m = model or row.get("model")
+    e = effort or row.get("effort")
+    pm = perm or row.get("permission_mode")
+    a = ["--bg", "--resume", resume_id(row), "-n", name, "--model", m or "<MODEL>"]
+    a += ["--effort", e or "<EFFORT>"]
+    if pm:
+        a += ["--permission-mode", pm]
+    return a
+
+
+def manual_cmd(row, args):
+    return "cd %s && claude %s" % (shlex.quote(row["dir"] or "."), " ".join(shlex.quote(a) for a in args))
+
+
+def wait_for(fn, timeout):
+    end = time.time() + timeout
+    while True:
+        v = fn()
+        if v:
+            return v
+        if time.time() >= end:
+            return None
+        time.sleep(poll())
+
+
+# ---------------------------------------------------------------- selecting targets
+def public(name, row):
+    keys = ("scope", "role", "always_on", "dir", "session_id", "job_id", "model", "effort", "kind", "state",
+            "needs", "tmux", "hold", "failed", "conflict", "managed", "id_history", "permission_mode", "updated", "flag_warn", "end_kind", "model_src", "model_at", "effort_src", "effort_at")
+    d = {k: row[k] for k in keys}
+    d["name"] = name
+    d["purpose"] = row["purpose"]
+    d["conv_id"], d["conv_how"] = row["conv_id"], row["conv_how"]
+    if asleep(row):
+        d["state"] = "asleep"  # retired by the daemon: reachable again with `fleet wake`
+    return d
+
+
+def select(reg, target, all_flag=False):
+    """names for a name | scope | --all (config-listed). Returns (names, error)."""
+    sess = reg["sessions"]
+    if all_flag:
+        cfg = load_config()
+        return sorted(n for n in cfg if n in sess), None
+    if target in sess:
+        return [target], None
+    names = sorted(n for n, r in sess.items() if r["scope"] == target)
+    if names:
+        return names, None
+    return [], "no session or scope named %s" % clean(target, 60)
+
+
+# ---------------------------------------------------------------- bg: the move
+def pane_target(row):
+    m = re.search(r"%(\d+)$", row.get("tmux") or "")
+    return "%" + m.group(1) if m else ""
+
+
+def check_move(name, row, force, model_override, effort_override=None):
+    """Refusals for moving a pane session. Returns (refusals, pane)."""
+    out = []
+    if not guard(name):
+        return ["outside FLEET_NAME_PREFIX (%s)" % os.environ.get("FLEET_NAME_PREFIX")], ""
+    if row["conflict"]:
+        return ["name conflict: two live sessions use it (%s)" % ", ".join(s[:8] for s in row["conflict"])], ""
+    if row["moving_until"] > time.time():
+        return ["already being moved by another fleet run"], ""
+    if row["kind"] == "job":
+        return ["already a background job (%s)" % row["job_id"]], ""
+    if row["kind"] != "pane":
+        return ["not running in a pane (kind %s)" % row["kind"]], ""
+    if (CALLER_SID and CALLER_SID in row_ids(row)) or (row["pid"] and is_descendant(os.getpid(), row["pid"])):
+        return ["this session runs the command (fleet runs inside it): /exit would end the command itself; run `fleet bg` from "
+                "another session or a plain shell. Skipped"], ""
+    if not (row["session_id"] and SID_RE.match(row["session_id"])):
+        return ["no session id"], ""
+    if not conv_ok(row):
+        return [conv_refusal(name, row)], ""
+    if not row["dir"] or not os.path.isdir(row["dir"]):
+        out.append("its directory is gone")
+    m = model_override or row["model"]
+    if not m or not MODEL_RE.match(m):
+        out.append("no recorded model for %s (a move without --model would run on the current default); use --model" % name)
+    e = effort_override or row["effort"]
+    if not e or e not in EFFORTS:
+        out.append("no recorded effort for %s (it would run on the default effort); use --effort <level> or the effort column of the config" % name)
+    ids = row_ids(row)
+    if (row["job_row"] or any(j["sid"] in ids for j in Sources().jobs.values())
+            or any(os.path.isdir(os.path.join(claude_home(), "jobs", i[:8])) for i in ids)):
+        out.append("a job row already exists for this session id (flags would start a copy): claude stop + claude rm it first")
+    pane = pane_target(row)
+    if not pane:
+        out.append("no tmux pane known for it")
+        return out, ""
+    rc, listing = tm("list-panes", "-a", "-F", "#{pane_id} #{pane_pid}")
+    ok = False
+    root = False
+    for line in listing.splitlines():
+        p = line.split()
+        if len(p) == 2 and p[0] == pane and p[1].isdigit() and is_descendant(row["pid"], int(p[1])):
+            ok = True
+            root = int(p[1]) == row["pid"]
+    if ok and root:
+        out.append("claude is the pane's own process (started with exec claude --resume, e.g. by the tmux restore): "
+                   "/exit would close the pane and maybe its window; not moved")
+        return out, pane
+    if not ok:
+        out.append("pane %s does not hold process %s" % (pane, row["pid"]))
+        return out, pane
+    status = row["state"]
+    if status == "waiting":
+        out.append("it waits for an answer to a dialog (not even --force overrides this)")
+    elif status != "idle":
+        why = "has background work" if status == "shell" else "is not idle (%s)" % status
+        if not force:
+            out.append(why + " (--force to override)")
+    rc, scr = tm("capture-pane", "-p", "-e", "-t", pane)
+    comp = composer_state(scr) if rc == 0 else "UNKNOWN"
+    if comp == "DRAFT":
+        out.append("the prompt box holds unsent text (not even --force overrides this)")
+    elif comp == "UNKNOWN" and not force:
+        out.append("no prompt box visible (a dialog or menu may be open) (--force to override)")
+    return out, pane
+
+
+def live_bg(name=None, job=None):
+    for r in Sources().live:
+        if r["kind"] == "job" and ((name and r["name"] == name) or (job and r["job"] == job)):
+            return r
+    return None
+
+
+SRC_TEXT = {"conversation": "from the conversation", "hook": "from the effort hook", "statusline": "from the statusline file",
+            "job flags": "from the job's saved flags", "config": "from the config column"}
+
+
+def ago(sec):
+    sec = max(0, int(sec))
+    return ("%dh%02dm" % (sec // 3600, sec % 3600 // 60)) if sec >= 3600 else ("%dm" % (sec // 60)) if sec >= 60 else "%ds" % sec
+
+
+def src_note(row, what, value, override):
+    """'[effort high, from the conversation, 3h ago]': where the model / effort fleet is about to pass came from, and how old
+    the record is, so a stale value is visible"""
+    if override:
+        return "[%s %s, from --%s]" % (what, value, what)
+    src = row.get("%s_src" % what, "")
+    at = row.get("%s_at" % what, 0)
+    return "[%s %s, %s%s]" % (what, value, SRC_TEXT.get(src, "source unknown"), ", %s ago" % ago(time.time() - at) if at else "")
+
+
+def bg_one(name, force, dry, model_override, effort_override):
+    """Returns (code, message): 0 moved / dry-run ok, 3 refused, 1 failed after the move began."""
+    row = do_sync(save=not dry)["sessions"][name]  # fresh: the session may have got busy since the first sync
+    if BRAKE["why"]:
+        return EXIT_REFUSED, "%s: refused: brake: %s" % (name, BRAKE["why"])
+    refusals, pane = check_move(name, row, force, model_override, effort_override)
+    model = model_override or row["model"]
+    effort = effort_override or row["effort"]
+    args = bg_args(row, name, model, effort)
+    cmdline = manual_cmd(row, args)
+    if refusals:
+        extra = ""
+        if any("no recorded model" in r or "no recorded effort" in r for r in refusals):
+            extra = "\n  by hand (fill in the <...> parts): %s" % cmdline
+        return EXIT_REFUSED, "%s: refused: %s%s" % (name, "; ".join(refusals), extra)
+    warn = ""
+    if not row["permission_mode"]:
+        warn = "\n%s: warning: permission mode unknown (not readable from its command line): the job starts in the settings default mode; a mode set with shift+tab is lost" % name
+    if dry:
+        return 0, "%s: would send /exit to pane %s, wait for pid %s to end, then run: %s %s %s%s" % (
+            name, pane, row["pid"], cmdline, src_note(row, "model", model, model_override), src_note(row, "effort", effort, effort_override), warn)
+    sid, pid = resume_id(row), row["pid"]  # (the conversation to resume: the session's own id unless its file is elsewhere)
+    mutate(lambda r: r["sessions"][name].__setitem__("moving_until", int(time.time()) + 180))
+    # the resume data goes to disk BEFORE /exit: a crash or a power loss after it leaves this record, and `fleet status`
+    # shows the half-done move with the exact command (cleared below once the job is verified)
+    moving_set(name, {"sid": sid, "dir": row["dir"], "model": model, "effort": effort, "mode": row["permission_mode"],
+                      "at": int(time.time())})
+    try:
+        tm("send-keys", "-t", pane, "-l", "/exit")
+        time.sleep(poll() / 2)
+        tm("send-keys", "-t", pane, "Enter")
+        if not wait_for(lambda: not proc_alive(pid), num_env("FLEET_EXIT_TIMEOUT", 30)):
+            return EXIT_FAILED, "%s: pid %s did not exit within the timeout (check pane %s; nothing else was sent). Resume by hand once it ended: %s" % (name, pid, pane, cmdline)
+        held = Sources().running(row_ids(row), "")
+        if held:
+            return EXIT_FAILED, "%s: a live process (%s) holds this session id already: not started again" % (name, clean(held["name"], 40))
+        t_start = time.time()
+        rc, out = run_claude(args, cwd=row["dir"])
+        if rc == 124:
+            return EXIT_FAILED, "%s: claude did not answer in time. The job may have started: check `claude agents` FIRST; only if there is no job named %s, resume by hand: %s" % (name, name, cmdline)
+        if rc != 0:
+            return EXIT_FAILED, "%s: the resume failed (exit %s: %s). Run by hand: %s" % (name, rc, out, cmdline)
+        wrong = []
+
+        def verified():
+            src = Sources()
+            for r in src.live:
+                if r["kind"] == "job" and r["name"] == name and r["sid"] == sid and r["job"]:
+                    j = src.jobs.get(r["job"])
+                    if j and j["sid"] == sid and j["name"] == name:
+                        wrong[:] = [k for k, want in (("--model", model), ("--effort", effort), ("--permission-mode", row["permission_mode"]))
+                                    if want and flag_value(j["flags"], k) != want]
+                        return r
+            return None
+        rec = wait_for(verified, num_env("FLEET_VERIFY_TIMEOUT", 30))
+        if not rec:
+            return EXIT_FAILED, "%s: the job did not show up with the same session id and name. Check `claude agents`; resume by hand: %s" % (name, cmdline)
+        if wrong:
+            moving_clear(name)
+            return EXIT_FAILED, "%s: the job is up, but its saved flags do not carry the requested %s (it would respawn on other settings). Stop it (claude stop %s), remove it (claude rm %s) and move again" % (name, ", ".join(wrong), rec["job"], rec["job"])
+        crashed = post_start_check([(name, row)], t_start).get(name)
+        if crashed:  # (the half-done record stays: status shows the resume command)
+            return EXIT_FAILED, "%s: the job started but did not stay up: %s. Resume by hand: %s" % (name, crashed, cmdline)
+        moving_clear(name)
+    finally:
+        def clear(r):
+            if name in r["sessions"]:
+                r["sessions"][name]["moving_until"] = 0
+        mutate(clear)
+    do_sync()
+    return 0, "%s: moved (job %s, session %s, model %s, effort %s%s) %s %s%s" % (
+        name, rec["job"], sid[:8], model, effort,
+        ", permission mode " + row["permission_mode"] if row["permission_mode"] else "",
+        src_note(row, "model", model, model_override), src_note(row, "effort", effort, effort_override), warn)
+
+
+def cmd_bg(a):
+    if a.effort and a.effort not in EFFORTS:
+        err("effort must be one of %s" % ", ".join(EFFORTS))
+        return EXIT_USAGE
+    if a.model and not MODEL_RE.match(a.model):
+        err("bad model name")
+        return EXIT_USAGE
+    if not a.target and not a.all:
+        err("usage: fleet bg <name|scope|--all> [--force] [--dry-run]")
+        return EXIT_USAGE
+    if a.dry_run:
+        with contextlib.nullcontext():
+            return bg_run(a)
+    begin_mutation()
+    with action_lock():
+        return bg_run(a)
+
+
+def bg_run(a):
+    reg = do_sync(save=not a.dry_run)
+    names, e = select(reg, a.target, a.all)
+    if e:
+        err(e)
+        return EXIT_FAILED
+    if not names:
+        err("nothing to move")
+        return EXIT_FAILED
+    moved, refused = [], []
+    for name in names:
+        c, msg = bg_one(name, a.force, a.dry_run, a.model, a.effort)
+        if c == EXIT_REFUSED and len(names) > 1 and ("already a background job" in msg or "not running in a pane" in msg or "this session runs the command" in msg):
+            say("skip " + msg)
+            continue
+        say(msg)
+        if c == EXIT_FAILED:
+            err("stopped: nothing else was touched")
+            return EXIT_FAILED
+        if c == EXIT_REFUSED:
+            refused.append(name)
+        elif not a.dry_run:
+            moved.append(name)
+    if moved:
+        say("moved: " + " ".join(moved))
+        say("tell each moved session to re-arm its watches and monitors: a move stops background shells and monitors (crons are kept)")
+    return EXIT_REFUSED if refused else 0
+
+
+# ---------------------------------------------------------------- up / revive
+# Job states real Claude writes into jobs/<id>/state.json (checked against the real files): working, done, blocked, stopped.
+# Only `stopped` (what `claude stop` leaves) means "stopped on purpose". `done` is the session's own verdict on its last
+# task and flips back to `working`: a live, idle job sits in it, so it is an ordinary restartable state. crashed: a kill -9
+# leaves it (tested); waiting: kept in case Claude writes it. A state outside this list is not touched.
+RESPAWN_STATES = ("working", "done", "blocked", "waiting", "crashed")
+
+
+def row_ids(row):
+    return {row["session_id"], *row["id_history"], row.get("conv_id") or ""} - {""}
+
+
+def daemon_end(job):
+    """How the Claude daemon last ended this job, from the newest lines of its log that name it: "killed" (`bg settled <job>
+    (killed)`: what a `claude stop` logs), "retired" (`bg retire <job>: settled|idle-prompt, idle 60m`, then `bg settled <job>
+    (done)`: the daemon puts an idle job to sleep after 60 minutes; checked on the real log), or "" (anything else: a crash
+    logs nothing, a later `spawned` / `claimed-spare` means it runs again). The tail of the log only; a missing or changed
+    log is simply ""."""
+    if not JOB_RE.match(job or ""):
+        return ""
+    try:
+        with open(os.path.join(claude_home(), "daemon.log"), "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - int(num_env("FLEET_DAEMON_LOG_BYTES", 524288))))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return ""
+    j = re.escape(job)
+    pat = re.compile(r"\bbg (retire|settled|claimed-spare|spawned) %s\b(:? ?\(?([a-z -]{1,20}))?" % j)
+    seen = []
+    for line in reversed(lines):
+        m = pat.search(line)
+        if m:
+            tail = line[m.end(1) + 1 + len(job):]
+            word = (re.match(r"^: (settled|idle-prompt)\b", tail) or re.match(r"^ \(([a-z -]{1,20})\)", tail))
+            seen.append((m.group(1), word.group(1) if word else ""))
+            if len(seen) == 2:
+                break
+    if not seen:
+        return ""
+    verb, word = seen[0]
+    if verb == "retire":
+        return "retired" if word in ("settled", "idle-prompt") else ""
+    if verb == "settled" and word == "killed":
+        return "killed"
+    if verb == "settled" and word == "done" and len(seen) == 2 and seen[1][0] == "retire" and seen[1][1] in ("settled", "idle-prompt"):
+        return "retired"
+    return ""
+
+
+def daemon_killed(job):
+    return daemon_end(job) == "killed"
+
+
+_STOP_LOGGED = set()
+
+
+def asleep(row):
+    """a gone job the daemon retired: asleep, not dead. Nothing restarts it by itself (not `up`, not the watchdog, not an
+    always-on session); `fleet wake` brings it back."""
+    if row["kind"] != "gone" or not row["job_id"] or row["state"] != "done":
+        return False
+    return row.get("end_kind") == "retired" or (row.get("end_kind") in ("", "clean") and daemon_end(row["job_id"]) == "retired")
+
+
+def stopped_on_purpose(row):
+    """job state `stopped`, or a clean stop of an idle job (state `done`) that the daemon logged as killed"""
+    if row["state"] == "stopped":
+        return True
+    return row["state"] == "done" and row.get("end_kind") == "clean" and daemon_killed(row["job_id"])
+
+
+def stop_verdict(row, name="<name>"):
+    """None = this gone job may be restarted; else the reason it is skipped (asleep, stopped on purpose, or no sign of a crash).
+    Job state `stopped` is a `claude stop` of a working or blocked job. A `claude stop` of an idle job leaves the state `done`
+    (checked live), the same as a death while idle and the same as a retire, so for `done` the way the process ended decides
+    (end_kind, set when the row went gone): retired = asleep, skipped for every session (always-on included); reboot or stale
+    session file = restart; clean end confirmed by the daemon log (killed) = stopped on purpose, skipped; clean end NOT
+    confirmed (a crashed job's stale file may have been swept by Claude already, or the log changed) = in doubt: an always-on
+    session is restarted, any other is skipped with this reason."""
+    st = row["state"]
+    if st == "stopped":
+        return "stopped on purpose (job state stopped): not restarted; `fleet up --include-stopped` starts it"
+    if st != "done":
+        return None
+    if asleep(row):
+        return "asleep (the daemon retired it after 60 minutes idle): not restarted; `fleet wake %s` brings it back" % name
+    end = row.get("end_kind", "")
+    if end in ("reboot", "stale"):
+        return None
+    if stopped_on_purpose(row):
+        return "stopped on purpose (a clean stop of a job in state done: its session file was removed and the daemon logged it killed): not restarted; `fleet up --include-stopped` starts it"
+    if row["always_on"]:
+        return None
+    return ("job state done and no sign of a crash or a reboot (a clean `claude stop` of an idle job leaves `done` too): not restarted; "
+            "`fleet up --include-stopped` starts it")
+
+
+def revive_plan(name, row, include_stopped=False, include_missing=False):
+    """(kind, args, cwd) or (None, reason, None)."""
+    if not guard(name):
+        return None, "outside FLEET_NAME_PREFIX", None
+    if row["conflict"]:
+        return None, "name conflict", None
+    if row["hold"]:
+        return None, "held", None
+    if row["moving_until"] > time.time():
+        return None, "being moved", None
+    if row["kind"] == "untracked" or row.get("alive_as"):
+        return None, "running under another name (%s): not started again" % clean(row.get("alive_as"), 40), None
+    if row["kind"] != "gone":
+        return None, "already running (%s)" % row["kind"], None
+    if not row["managed"]:
+        return None, "not a background session", None
+    if row.get("unknown"):
+        return None, "a session file of another pid domain claims it: its state is unknown, not started", None
+    if recorded_alive(row):
+        return None, "its last recorded process (pid %s) is still alive: not started again (the Claude data may be unreadable, not the session dead)" % row["last_pid"], None
+    cwd = row["dir"] if row["dir"] and os.path.isdir(row["dir"]) else None
+    has_row = bool(row["job_row"] and row["job_id"] and JOB_RE.match(row["job_id"]))
+    if has_row:
+        if row["state"] in ("stopped", "done"):
+            why = stop_verdict(row, name)
+            if why and not include_stopped:
+                return None, why, None
+        elif row["state"] not in RESPAWN_STATES:
+            return None, "job state %s is not restartable (finished, failed or unknown): not respawned" % clean(row["state"], 20), None
+        if not conv_ok(row):
+            return None, conv_refusal(name, row), None
+        if row["conv_how"] == "own":
+            return "respawn", ["respawn", row["job_id"]], cwd or HOME  # the job's own id has a conversation file
+        # the job's own id has NO conversation file (an in-app move): `claude respawn` would crash. Resume the real
+        # conversation under the session's name instead, with every flag; the old dead job row is left alone (no `rm` here)
+        if not cwd:
+            return None, "its job has no conversation file of its own and its directory is gone", None
+        if not row["model"] or not row["effort"]:
+            return None, "no recorded %s for %s: not resumed (it would run on the default). By hand, filling in the <...> parts: %s" % (
+                "model" if not row["model"] else "effort", name, manual_cmd(row, bg_args(row, name))), None
+        return "resume", bg_args(row, name), cwd
+    # no job row: the job was removed (claude rm), or never moved. Resume only for always-on sessions or on request.
+    if not (row["always_on"] or include_missing):
+        return None, "the job row is gone (removed on purpose?): not resumed; `fleet up --include-missing` does it", None
+    if not cwd:
+        return None, "no job row and its directory is gone", None
+    if not row["session_id"]:
+        return None, "no job row and no recorded session id to resume with", None
+    if not conv_ok(row):
+        return None, conv_refusal(name, row), None
+    manual = manual_cmd(row, bg_args(row, name))
+    if not row["model"]:
+        return None, "no recorded model for %s: not resumed (it would run on the default model). By hand, filling in the <...> parts: %s" % (name, manual), None
+    if not row["effort"]:
+        return None, "no recorded effort for %s: not resumed (it would run on the default effort). By hand, filling in the <...> parts: %s" % (name, manual), None
+    return "resume", bg_args(row, name), cwd
+
+
+CRASH_RE = re.compile(r"^\[([0-9T:.\-]+Z)\] \[bg\] bg settled ([0-9A-Za-z]{4,16}) \(crashed\)(.*)$")
+
+
+def crash_line(jobs, since):
+    """The newest daemon.log line `bg settled <job> (crashed): ...` for one of these job ids, written at or after `since`
+    (epoch seconds), or "". What a resume or respawn of a job whose conversation file cannot be found logs about 10 s after
+    it started (checked on the real log: `source session <id> not found`); `claude` itself reports success before that."""
+    jobs = {j for j in jobs if j}
+    if not jobs:
+        return ""
+    try:
+        with open(os.path.join(claude_home(), "daemon.log"), "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 262144))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        m = CRASH_RE.match(line)
+        if m and m.group(2) in jobs and parse_iso(m.group(1)) >= int(since) - 1:
+            return clean("bg settled %s (crashed)%s" % (m.group(2), m.group(3)), 200)
+    return ""
+
+
+def post_start_check(items, since):
+    """After a resume / respawn / wake: for FLEET_CRASH_WAIT seconds (default 15) watch the daemon log for a crash line of the
+    job, and afterwards check that the session still runs. items = [(name, row)]. Returns {name: reason} for the ones that
+    did not stay up. The whole window is always waited out (the crash comes late), unless every item has failed already."""
+    out = {}
+    end = time.time() + num_env("FLEET_CRASH_WAIT", 15)
+    jobs = {n: {r["job_id"], resume_id(r)[:8]} for n, r in items}
+    while True:
+        for n, r in items:
+            if n in out:
+                continue
+            live = Sources().running(row_ids(r), "")
+            line = crash_line(jobs[n] | ({live["job"]} if live else set()), since)
+            if line:
+                out[n] = "the daemon logged a crash: %s" % line
+        if len(out) == len(items) or time.time() >= end:
+            break
+        time.sleep(poll())
+    src = Sources()
+    for n, r in items:
+        if n not in out and not src.running(row_ids(r), ""):
+            out[n] = "the session ended within %ds of its start (nothing in the daemon log)" % int(num_env("FLEET_CRASH_WAIT", 15))
+    return out
+
+
+def revive_many(reg, names, dry, include_stopped=False, include_missing=False):
+    """Respawn / resume each name, then verify all. Returns list of (name, ok, msg); ok None = skipped. The caller holds
+    the action lock. Nothing is started that a live process already holds (any name): the live data is read again
+    about 2 s after planning, and once more right before each claude call."""
+    results, plans = [], []
+    for name in names:
+        row = reg["sessions"][name]
+        kind, args, cwd = revive_plan(name, row, include_stopped, include_missing)
+        if not kind:
+            results.append((name, None, args))
+            continue
+        if dry:
+            results.append((name, True, "would run: " + manual_cmd(row, args)))
+            continue
+        plans.append((name, row, kind, args, cwd))
+    started = []
+    t_start = time.time()
+    if plans:
+        time.sleep(num_env("FLEET_RECHECK", 2.0))  # a second read: a torn or late read must not look like a death
+    for name, row, kind, args, cwd in plans:
+        live = Sources().running(row_ids(row), row["job_id"])
+        if live:
+            results.append((name, None, "a live process already holds this session (%s): not started again" % clean(live["name"], 40)))
+            continue
+        if recorded_alive(row):
+            results.append((name, None, "its last recorded process (pid %s) is still alive: not started again" % row["last_pid"]))
+            continue
+        t_start = min(t_start, time.time())
+        rc, out = run_claude(args, cwd=cwd)
+        if rc != 0:
+            log("revive %s: claude %s failed (%s)" % (name, kind, out))
+            results.append((name, False, "claude %s failed (exit %s: %s); by hand: %s" % (kind, rc, out, manual_cmd(row, args))))
+            continue
+        started.append((name, row, kind, args))
+        results.append((name, True, kind))
+    if started:
+        def pending():
+            src = Sources()
+            return [n for n, r, k, a in started if not src.running(row_ids(r), r["job_id"])]
+        end = time.time() + num_env("FLEET_VERIFY_TIMEOUT", 30)
+        while pending() and time.time() < end:
+            time.sleep(poll())
+        miss = set(pending())
+        sn = {n for n, r, k, a in started}
+        results = [(n, False, "not up after the timeout (%s)" % m) if n in miss else (n, ok, "up (%s)" % m) if (ok and n in sn) else (n, ok, m)
+                   for n, ok, m in results]
+        crashed = post_start_check([(n, r) for n, r, k, a in started if n not in miss], t_start)
+        if crashed:
+            byname = {n: (r, a) for n, r, k, a in started}
+            for n, why in crashed.items():
+                log("revive %s: %s" % (n, why))
+            results = [(n, False, "%s; by hand: %s" % (crashed[n], manual_cmd(*byname[n]))) if n in crashed else (n, ok, m) for n, ok, m in results]
+    return results
+
+
+def brake_reason():
+    """A bad read of the Claude data must not look like a death. A row that was running at the last save and reads as
+    gone now is judged by the process it last ran as (pid + start time, read from /proc, not from Claude's files): that
+    process gone = a real death (a daemon loss, a reboot, a crash: restart, under the action lock, the second read and the
+    3-per-hour backoff); still alive, or a session file of another pid domain claims the session = the files are
+    unreadable or changed: act on nothing and write nothing. Returns the reason text, or ''."""
+    ghosts = [w for w in SYNC_STATS.get("went", [])
+              if w["unknown"] or (w["pid"] and proc_alive(w["pid"], w["start"] or None))]
+    if not ghosts:
+        return ""
+    names = sorted(clean(w["name"], 20) for w in ghosts)
+    return ("%d session(s) (%s%s) read as gone but their processes still run (or another pid domain claims them): Claude's "
+            "session files look unreadable. Nothing restarted or saved. Run `fleet status`, compare with `claude agents`" % (
+                len(names), ", ".join(names[:2]), ", ..." if len(names) > 2 else ""))
+
+
+def real_boot():
+    """True only when the machine booted since the last tick: the boot id (/proc/sys/kernel/random/boot_id) differs from
+    the one stored in the state dir by the previous tick. No stored value (first run, a wiped state) = not a boot. The
+    `--boot` flag of `watch` / `up` is a request; only this makes it count."""
+    cur = current_boot_id()
+    try:
+        with open(os.path.join(state_dir(), "boot_id")) as f:
+            prev = f.read().strip()
+    except OSError:
+        return False
+    return bool(cur and prev and cur != prev)
+
+
+def store_boot_id():
+    cur = current_boot_id()
+    if cur:
+        with contextlib.suppress(OSError):
+            write_atomic(os.path.join(ensure_state_dir(), "boot_id"), cur + "\n")
+
+
+def cmd_up(a):
+    exempt = bool(a.boot) and real_boot()
+    if a.boot and not exempt:
+        say("note: --boot given, but the boot id is the same as at the last tick (or unknown): this is a normal start, the brake applies")
+    if a.dry_run:
+        reg = do_sync(save=False)
+        why = BRAKE["why"]
+        lock = contextlib.nullcontext()
+    else:
+        begin_mutation()
+        lock = action_lock()
+    with lock:
+        if not a.dry_run:
+            reg, why = sync_guarded(exempt)
+        if why and not exempt:
+            say("brake: %s. Acting on nothing, nothing written." % why)
+            return EXIT_REFUSED
+        res = revive_many(reg, sorted(reg["sessions"]), a.dry_run, a.include_stopped, a.include_missing)
+    bad = 0
+    for name, ok, msg in res:
+        if ok is None:
+            if not msg.startswith("already running") and msg not in ("not a background session", "outside FLEET_NAME_PREFIX"):
+                say("%s: skipped, %s" % (name, msg))
+            continue
+        say("%s: %s" % (name, msg))
+        bad += 0 if ok else 1
+    if not a.dry_run:
+        do_sync()
+    return EXIT_FAILED if bad else 0
+
+
+# ---------------------------------------------------------------- wake / who / new
+def wake_ready(name, row, job):
+    """the session can take a message: a session file with a live pid for this session (as a job), and its messaging socket
+    there (checked live: a respawned or resumed job has both within a second or two, with no first turn needed)"""
+    for r in Sources().live:
+        if r["kind"] == "job" and r["name"] == name and (r["sid"] in row_ids(row) or (job and r["job"] == job)):
+            return not r["sock"] or os.path.exists(r["sock"])
+    return False
+
+
+def wake_flags_ok(row, flags):
+    """the saved flags of the job row carry exactly the recorded model, effort and permission mode: a `respawn` then keeps them"""
+    want = (("--model", row["model"]), ("--effort", row["effort"]), ("--permission-mode", row["permission_mode"]))
+    return all(not v or flag_value(flags, k) == v for k, v in want) and bool(flag_value(flags, "--model")) and bool(flag_value(flags, "--effort"))
+
+
+def cmd_wake(a):
+    if not NAME_RE.match(a.name or ""):
+        err("bad session name")
+        return EXIT_USAGE
+    begin_mutation()
+    with action_lock():
+        return wake_run(a)
+
+
+def wake_run(a):
+    name = a.name
+    timeout = max(1.0, min(600.0, float(a.timeout)))
+    reg, why = sync_guarded()
+    if why:
+        say("%s: refused: brake: %s" % (name, why))
+        return EXIT_REFUSED
+    row = reg["sessions"].get(name)
+    if row is None:
+        err("no session named %s (`fleet who` lists them)" % clean(name, 60))
+        return EXIT_FAILED
+    if not guard(name):
+        say("%s: refused: outside FLEET_NAME_PREFIX (%s)" % (name, os.environ.get("FLEET_NAME_PREFIX")))
+        return EXIT_REFUSED
+    if row["kind"] in ("job", "pane"):
+        say("awake")  # nothing to do, no claude call
+        return 0
+    refuse = lambda why: (say("%s: not woken: %s" % (name, why)), EXIT_REFUSED)[1]
+    if CALLER_SID and CALLER_SID in row_ids(row):
+        return refuse("this is the session that runs the command")
+    if row["conflict"]:
+        return refuse("two live sessions use this name")
+    if row["kind"] == "untracked" or row.get("alive_as"):
+        return refuse("it runs under another name (%s)" % clean(row.get("alive_as"), 40))
+    ent = load_entries()
+    if row["scope"] in ent["disabled"]:
+        return refuse("its entry %s is disabled (`fleet unstash %s` brings it back)" % (row["scope"], row["scope"]))
+    if row.get("unknown") or recorded_alive(row):
+        return refuse("its last process is still alive or another pid domain claims it: the Claude data may be unreadable")
+    if not row["managed"] or not (row["session_id"] and SID_RE.match(row["session_id"])):
+        return refuse("fleet has no background session of that name to wake (`fleet new` creates one)")
+    if row["hold"] and not a.force:
+        return refuse("held (`fleet release %s` first, or --force)" % name)
+    if stopped_on_purpose(row) and not a.force:
+        return refuse("stopped on purpose (--force wakes it anyway)")
+    if not row["dir"] or not os.path.isdir(row["dir"]):
+        return refuse("its directory is gone")
+    if not row["model"] or not row["effort"]:
+        say("%s: not woken: no recorded %s (it would run on the default): by hand, filling in the <...> parts: %s" % (
+            name, "model" if not row["model"] else "effort", manual_cmd(row, bg_args(row, name))))
+        return EXIT_REFUSED
+    job = row["job_id"] if row["job_row"] and JOB_RE.match(row["job_id"] or "") else ""
+    src = Sources()
+    held = src.running(row_ids(row), job)
+    if held:
+        return refuse("a live process (%s) holds this session already" % clean(held["name"], 40))
+    flags = src.jobs[job]["flags"] if job and job in src.jobs else []
+    if not conv_ok(row):
+        say("%s: not woken: %s" % (name, conv_refusal(name, row)))
+        return EXIT_REFUSED
+    if job and row["conv_how"] == "own" and wake_flags_ok(row, flags):
+        args, how = ["respawn", job], "respawn"
+    else:
+        if job:  # the saved flags would not carry the recorded model / effort: start again from scratch with all of them
+            j = src.jobs.get(job)
+            if not j or j["sid"] != row["session_id"] or j["name"] != name:
+                return refuse("its job row does not match the session (name or id): not removing it")
+            rc, out = run_claude(["rm", job], rm_ok=True)  # the ONE caller of `claude rm`: this session's own, dead job row
+            if rc != 0:
+                say("%s: not woken: `claude rm %s` was refused (exit %s: %s)" % (name, job, rc, out))
+                return EXIT_FAILED
+        args, how = bg_args(row, name), "resume"
+    log("wake %s: %s (job %s)" % (name, how, job or "none"))
+    t_start = time.time()
+    rc, out = run_claude(args, cwd=row["dir"])
+    if rc != 0:
+        say("%s: not woken: claude %s failed (exit %s: %s). By hand: %s" % (name, how, rc, out, manual_cmd(row, args)))
+        return EXIT_FAILED
+    if not wait_for(lambda: wake_ready(name, row, job), timeout):
+        say("%s: started (%s) but not ready for a message after %ds: check `claude agents`" % (name, how, int(timeout)))
+        return EXIT_FAILED
+    crashed = post_start_check([(name, row)], t_start).get(name)
+    if crashed:
+        say("%s: started (%s) but did not stay up: %s. By hand: %s" % (name, how, crashed, manual_cmd(row, args)))
+        return EXIT_FAILED
+    reg = do_sync()
+    r2 = reg["sessions"].get(name)
+    if r2 and r2["job_row"] and Sources().jobs.get(r2["job_id"]) and not wake_flags_ok(r2, Sources().jobs[r2["job_id"]]["flags"]):
+        err("%s: warning: the job's saved flags do not carry the recorded model / effort" % name)
+    say("awake")
+    return 0
+
+
+def who_state(r):
+    if r["kind"] in ("job", "pane"):
+        return "awake"
+    if r["hold"]:
+        return "held"
+    return "asleep" if asleep(r) else "down"
+
+
+def who_rows(reg, cfg, only=None):
+    rows = []
+    for n, r in reg["sessions"].items():
+        if only and n != only:
+            continue
+        if not (r["managed"] or n in cfg):
+            continue
+        d = r["dir"] or ""
+        if HOME and (d == HOME or d.startswith(HOME + "/")):
+            d = "~" + d[len(HOME):]
+        rows.append({"name": n, "entry": r["scope"] if r["scope"] and r["scope"] != "unsorted" else "-", "role": r["role"] or "-",
+                     "dir": clean(d, 120) or "-", "state": who_state(r), "purpose": clean(r["purpose"], 160),
+                     "conv": (r.get("conv_how") or "-") if r.get("conv_how") in ("", "own", "unknown") else (r.get("conv_id") or "")[:8],
+                     "conv_how": r.get("conv_how", "")})
+    rows.sort(key=lambda x: (x["entry"] == "-", x["entry"], x["name"]))
+    return rows
+
+
+def cmd_who(a):
+    reg = sync_ro()
+    if a.name and not NAME_RE.match(a.name):
+        err("bad session name")
+        return EXIT_USAGE
+    rows = who_rows(reg, load_config(), a.name)
+    if a.name and not rows:
+        err("no session named %s" % clean(a.name, 60))
+        return EXIT_FAILED
+    if a.json:
+        say(json.dumps(rows, indent=1, sort_keys=True))
+        return 0
+    cols = ("name", "entry", "role", "dir", "state", "purpose")
+    for r in rows:  # a session whose own id has no conversation file: the conversation it resumes by, or `conv:unknown`
+        r["state_txt"] = r["state"] + (" conv:%s" % r["conv"] if r["conv_how"] not in ("", "own") else "")
+    w = [max([len(r[c if c != "state" else "state_txt"]) for r in rows] or [0]) for c in cols[:5]]
+    for r in rows:
+        say("  ".join(r[c if c != "state" else "state_txt"].ljust(w[i]) for i, c in enumerate(cols[:5])) + ("  " + r["purpose"] if r["purpose"] else ""))
+    return 0
+
+
+NEW_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+){1,3}$")
+
+
+def name_taken(name, reg, src, cfg):
+    """where a session of that name exists already (registry incl. former names, live sessions, job rows, the config), or ''"""
+    for n, r in reg["sessions"].items():
+        if n == name:
+            return "in the registry"
+        if name in r["former_names"]:
+            return "as a former name of %s" % n
+    if name in cfg:
+        return "in the config"
+    if any(r["name"] == name for r in src.all_live):
+        return "as a live session"
+    if any(j["name"] == name for j in src.jobs.values()):
+        return "as a job row"
+    return ""
+
+
+def config_append(line):
+    """append one line to the local config (atomic write, everything else untouched, comments kept)"""
+    p = config_path()
+    with locked():
+        try:
+            with open(p) as f:
+                text = f.read()
+            mode = os.stat(p).st_mode & 0o777
+        except OSError:
+            text, mode = "", 0o600
+        if text and not text.endswith("\n"):
+            text += "\n"
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        write_atomic(p, text + line + "\n", mode)
+
+
+def cmd_new(a):
+    name = a.name
+    if not NEW_NAME_RE.match(name or "") or len(name) > 64:
+        err("name rule: lowercase letters, digits and dashes, 2 to 4 dash-separated words, the first word is the project "
+            "(for example shop-research)")
+        return EXIT_USAGE
+    if not guard(name):
+        err("%s: outside FLEET_NAME_PREFIX (%s)" % (name, os.environ.get("FLEET_NAME_PREFIX")))
+        return EXIT_REFUSED
+    problems = []
+    if not a.model or not MODEL_RE.match(a.model):
+        problems.append("--model is required (a model name or alias): fleet never starts a session on the default model")
+    if not a.effort or a.effort not in EFFORTS:
+        problems.append("--effort is required: one of %s (never the default effort)" % ", ".join(EFFORTS))
+    if not a.dir or not os.path.isdir(a.dir):
+        problems.append("--dir must be an existing directory")
+    if a.permission_mode and not re.match(r"^[A-Za-z]{2,24}$", a.permission_mode):
+        problems.append("bad --permission-mode")
+    if a.role and not re.match(r"^[A-Za-z0-9._-]{1,40}$", a.role):
+        problems.append("--role: letters, digits, dot, dash and underscore only (one word)")
+    brief = a.brief or ""
+    if not brief.strip() or "\0" in brief or len(brief) > 20000:
+        problems.append("the brief (the first prompt) is required, at most 20000 characters")
+    if problems:
+        for x in problems:
+            err(x)
+        return EXIT_USAGE
+    cwd = os.path.realpath(a.dir)
+    purpose = clean((a.purpose or "").replace("#", ""), 160)
+    begin_mutation()
+    with action_lock():
+        reg, why = sync_guarded()
+        if why:
+            say("%s: refused: brake: %s" % (name, why))
+            return EXIT_REFUSED
+        src = Sources()
+        where = name_taken(name, reg, src, load_config())
+        if where:
+            say("%s: refused: that name exists already (%s): `fleet wake %s` brings it back; or pick another name" % (name, where, name))
+            return EXIT_REFUSED
+        args = ["--bg", "-n", name, "--model", a.model, "--effort", a.effort]
+        if a.permission_mode:
+            args += ["--permission-mode", a.permission_mode]
+        args += ["--", brief]  # the brief is ONE argument, after `--`: never parsed as an option, never through a shell
+        rc, out = run_claude(args, cwd=cwd)
+        if rc != 0:
+            say("%s: claude refused or failed (exit %s): %s" % (name, rc, out))
+            if "not trusted" in out:
+                say("  that directory is not trusted yet: run `claude` once in %s and accept the trust prompt, then retry. Nothing was created." % cwd)
+            elif rc == 124:
+                say("  the job may have started: check `claude agents` for %s before retrying" % name)
+            return EXIT_FAILED
+        found = {}
+
+        def up():
+            s2 = Sources()
+            for j in s2.jobs.values():
+                if j["name"] == name:
+                    for r in s2.live:
+                        if r["kind"] == "job" and r["name"] == name and r["job"] == j["id"]:
+                            found["j"], found["r"] = j, r
+                            return True
+            return False
+        okup = wait_for(up, num_env("FLEET_VERIFY_TIMEOUT", 30))
+        j = found.get("j")
+        bad = []
+        if not okup:
+            bad.append("no live job named %s showed up" % name)
+        else:
+            for k, want in (("--model", a.model), ("--effort", a.effort), ("--permission-mode", a.permission_mode or "")):
+                if want and flag_value(j["flags"], k) != want:
+                    bad.append("its saved flags do not carry %s %s" % (k, want))
+        if bad:
+            ids = [x["id"] for x in Sources().jobs.values() if x["name"] == name]
+            say("%s: created but NOT verified: %s." % (name, "; ".join(bad)))
+            if ids:
+                say("  what exists: job %s. Clean up with: claude stop %s ; claude rm %s (then retry)" % (ids[0], ids[0], ids[0]))
+            else:
+                say("  what exists: nothing found; check `claude agents` for %s" % name)
+            return EXIT_FAILED
+        config_append("%s %s %s %s %s" % (name, a.role or "-", "always-on" if a.always_on else "-", a.effort, purpose) if purpose else
+                      "%s %s %s %s" % (name, a.role or "-", "always-on" if a.always_on else "-", a.effort))
+        do_sync()
+    say("%s: created (job %s, session %s, model %s, effort %s). Message it by name (SendMessage); `fleet wake %s` if it ever sleeps." % (
+        name, j["id"], j["sid"][:8], a.model, a.effort, name))
+    return 0
+
+
+# ---------------------------------------------------------------- hold / release / status / waiting / owns
+def cmd_hold(a, value):
+    begin_mutation()
+    with locked():
+        reg = load_registry()
+        r = reg["sessions"].get(a.name)
+        if r is not None:
+            r["hold"] = value
+            if not value:
+                r["failed"] = False
+                r["failed_notified"] = False
+                r["restarts"] = []
+            save_registry(reg)
+    if r is None:
+        err("unknown session %s (run fleet sync)" % clean(a.name, 60))
+        return EXIT_FAILED
+    say("%s: %s" % (a.name, "held" if value else "released"))
+    return 0
+
+
+def conv_text(r):
+    """'' when the session's own id has its conversation file (or nothing is known yet), else `conv:<short id>` for the
+    pre-move conversation fleet resolved, or `conv:unknown`"""
+    how = r.get("conv_how", "")
+    if how in ("", "own"):
+        return ""
+    return "conv:%s" % ((r.get("conv_id") or "")[:8] if how in CONV_KNOWN else "unknown")
+
+
+def flags_of(r):
+    f = []
+    if r["hold"]:
+        f.append("held")
+    if r["always_on"]:
+        f.append("always-on")
+    if r["failed"]:
+        f.append("failed")
+    if r["conflict"]:
+        f.append("CONFLICT")
+    if r["kind"] == "untracked":
+        f.append("renamed/untracked")
+    if r["former_names"]:
+        f.append("was:" + r["former_names"][0])
+    if r.get("unknown"):
+        f.append("UNKNOWN(pid domain)")
+    for k in r.get("flag_warn", []):
+        f.append("NO-%s-FLAG" % k[2:].upper())
+    if conv_text(r):
+        f.append("NO-OWN-CONV:" + conv_text(r)[5:])  # the session id has no conversation file: resumed by the one shown
+    return ",".join(f)
+
+
+def status_src(r, what):
+    """' (conv 3h)' after the model / effort in `fleet status`: the source (conv, hook, statusline, flags, config) and the age"""
+    short = {"conversation": "conv", "hook": "hook", "statusline": "statusline", "job flags": "flags", "config": "config"}.get(r.get(what + "_src", ""), "?")
+    at = r.get(what + "_at", 0)
+    return " (%s%s)" % (short, " " + ago(time.time() - at) if at else "")
+
+
+def cmd_status(a):
+    reg = load_registry_tolerant() if a.no_sync else sync_ro()
+    rows = {n: r for n, r in reg["sessions"].items() if not a.filter or a.filter in (n, r["scope"])}
+    if a.json:
+        say(json.dumps({n: public(n, r) for n, r in sorted(rows.items())}, indent=1, sort_keys=True))
+        return 0
+    cols = ["NAME", "ENTRY", "ROLE", "KIND", "STATE", "MODEL", "EFFORT", "FLAGS", "NEEDS"]
+    table = [cols] + [[n, r["scope"], r["role"] or "-", r["kind"], "asleep" if asleep(r) else r["state"], (r["model"] + status_src(r, "model")) if r["model"] else "-", (r["effort"] + status_src(r, "effort")) if r["effort"] else "-",
+                       flags_of(r) or "-", clean(r["needs"], 60) or "-"]
+                      for n, r in sorted(rows.items(), key=lambda x: (x[1]["scope"], x[0]))]
+    w = [max(len(row[i]) for row in table) for i in range(len(cols))]
+    for row in table:
+        say("  ".join(c.ljust(w[i]) for i, c in enumerate(row)).rstrip())
+    for nm, sid8, kind in SYNC_STATS.get("untracked", []):
+        say("untracked: a live %s session %s (%s) has no name fleet can use: it is seen (never started again) but not managed" % (kind, clean(nm, 40), sid8))
+    warned = sorted((n, r["flag_warn"]) for n, r in rows.items() if r.get("flag_warn"))
+    if warned:
+        say("warning: the saved respawn flags of these jobs carry no %s: a respawn or `fleet up` then takes the DEFAULT of the moment "
+            "(not the model / effort the session runs on): %s. Fix: stop the job (claude stop <job>), remove it (claude rm <job>), "
+            "then `fleet bg` it again from a pane session with --model / --effort." % (
+                "--model or --effort", ", ".join("%s (%s)" % (n, " ".join(w)) for n, w in warned)))
+    if SYNC_STATS.get("foreign"):
+        say("note: %d session file(s) of another pid domain were ignored (their sessions are never started, stopped or moved from here)" % SYNC_STATS["foreign"])
+    if BRAKE["why"]:
+        say("brake: %s" % BRAKE["why"])
+    for n, r in sorted(load_moving().items()):
+        if not Sources().running({r["sid"]}, ""):
+            say("HALF-DONE MOVE: %s was exited at %s but no job holds its session %s. Resume it by hand: %s" % (
+                n, time.strftime("%F %T", time.localtime(float(r.get("at", 0) or 0))), r["sid"][:8], moving_cmd(n, r)))
+    return 0
+
+
+def waiting_list(reg):
+    return [{"name": n, "scope": r["scope"], "kind": r["kind"], "needs": r["needs"]}
+            for n, r in sorted(reg["sessions"].items()) if r["needs"]]
+
+
+def cmd_waiting(a):
+    reg = sync_ro()
+    w = waiting_list(reg)
+    if a.json:
+        say(json.dumps(w, indent=1))
+    else:
+        for x in w:
+            say("%s\t%s\t%s" % (x["name"], x["scope"], x["needs"]))
+    return 0
+
+
+def cmd_owns(a):
+    """exit 0 and the name when fleet runs the session as a JOB: the row's last saved kind is `job`, or `gone` after having
+    been a job with a job row in a restartable state (a reboot or a daemon loss: `up` brings it back). A session that now
+    runs in a pane (a stopped job resumed by hand), a stopped job, and a row that was last a pane are NOT owned: the
+    tmux restore resumes those itself."""
+    sid = a.session_id
+    if not SID_RE.match(sid):
+        return 1
+    try:
+        with open(os.path.join(state_dir(), "ids", sid)) as f:
+            parts = f.readline().rstrip("\n").split("\t")
+    except OSError:
+        return 1
+    if len(parts) < 3 or not NAME_RE.match(parts[0]) or not JOB_RE.match(parts[2]):
+        return 1
+    if not os.path.exists(os.path.join(claude_home(), "jobs", parts[2], "state.json")):
+        return 1
+    try:
+        row = load_registry()["sessions"].get(parts[0])
+    except RegistryCorrupt:
+        return 1
+    if not row or sid not in row_ids(row) or row["conflict"]:
+        return 1
+    if row["kind"] == "job":
+        pass
+    elif not (row["kind"] == "gone" and row["last_kind"] == "job" and row["job_row"] and row["state"] in RESPAWN_STATES):
+        return 1
+    say(parts[0])
+    return 0
+
+
+# ---------------------------------------------------------------- watch
+def notify(*args):
+    cmd = [env("FLEET_NOTIFY", "notify-user")] + [args[0]] + [clean(x, 240) for x in args[1:]]
+    try:
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def public_snapshot(reg, now=None):
+    return {"time": now or int(time.time()), "pid": os.getpid(),
+            "sessions": {n: public(n, r) for n, r in sorted(reg["sessions"].items())},
+            "waiting": waiting_list(reg)}
+
+
+TICK = {"upped": False}
+
+
+def tick(do_up=False, boot=False):
+    """One watchdog cycle. Returns the status dict. do_up = bring every registered session back first (watch start);
+    boot = that first up is exempt from the brake, but only when the machine really booted since the last tick
+    (real_boot(): the boot id changed); a unit restart on the same boot is a normal start. The boot id is stored on every
+    tick. TICK["upped"] says whether the start-up `up` ran (a braked or failed tick leaves it to the next one)."""
+    TICK["upped"] = False
+    exempt = bool(boot and do_up and real_boot())
+    reg, why = sync_guarded(exempt)
+    store_boot_id()
+    now = int(time.time())
+    braked = bool(why)
+    died = [w["name"] for w in SYNC_STATS.get("went", []) if w["kind"] == "job" and not w["unknown"]
+            and reg["sessions"].get(w["name"], {}).get("end_kind") != "retired"]  # a retire is not a death: no notice, no restart
+    if braked:
+        log("brake: %s: acting on nothing this tick, nothing written" % why)
+
+        def flag(r):
+            m = r.setdefault("meta", {})
+            first = not m.get("brake_notified")
+            m["brake_notified"] = True
+            return first
+        if mutate(flag):
+            notify("needs", "fleet", "brake: %s." % why)
+        snap = public_snapshot(reg, now)
+        write_atomic(os.path.join(ensure_state_dir(), "status.json"), json.dumps(snap, indent=1, sort_keys=True) + "\n")
+        return snap
+    if reg.get("meta", {}).get("brake_notified"):
+        mutate(lambda r: r.setdefault("meta", {}).__setitem__("brake_notified", False))
+    if len(died) > int(num_env("FLEET_BRAKE_MAX", 3)) and not exempt:
+        # a daemon loss or a crash takes every job at once: really dead (their last pids are gone), so restarted below
+        log("%d background sessions died at once (%s): restarting them" % (len(died), ", ".join(sorted(died)[:6])))
+        notify("needs", "fleet", "%d background sessions died at once (%s): restarting them" % (len(died), ", ".join(sorted(died)[:3])))
+    names, notices = [], []
+    with contextlib.ExitStack() as stack:
+        got = True
+        try:
+            stack.enter_context(action_lock())
+        except Busy:
+            got = False
+            log("tick: another fleet action is running: no restarts this tick")
+        if got:
+            if do_up:
+                for n, ok, m in revive_many(reg, sorted(reg["sessions"]), False):
+                    if ok is not None:
+                        log("up %s: %s" % (n, m))
+                    elif not m.startswith("already running") and m not in ("not a background session", "outside FLEET_NAME_PREFIX"):
+                        log("up %s: skipped, %s" % (n, m))
+                reg = do_sync()
+                TICK["upped"] = True
+
+            def decide(r):
+                for name, row in sorted(r["sessions"].items()):
+                    if not row["always_on"] or row["hold"] or row["kind"] != "gone" or not row["managed"] or row["failed"]:
+                        continue
+                    why = stop_verdict(row, name)
+                    if why:  # stopped on purpose, or no sign of a crash: not restarted (logged once per process)
+                        if (name, why) not in _STOP_LOGGED:
+                            _STOP_LOGGED.add((name, why))
+                            log("restart %s: skipped, %s" % (name, why))
+                        continue
+                    if row["unknown"] or recorded_alive(row):
+                        continue  # not a death (a bad read): never counted, never restarted
+                    if row["conflict"] or row["moving_until"] > now or not guard(name):
+                        continue
+                    recent = [t for t in row["restarts"] if now - t < 3600]
+                    row["restarts"] = recent
+                    if len(recent) >= 3:
+                        row["failed"] = True
+                        row["state"] = "failed"
+                        if not row["failed_notified"]:
+                            row["failed_notified"] = True
+                            notices.append(name)
+                        continue
+                    row["restarts"].append(now)
+                    names.append(name)
+            mutate(decide)
+            for name in notices:
+                notify("needs", "fleet", "%s keeps dying" % name)
+                log("%s keeps dying: marked failed" % name)
+            if names:
+                reg = load_registry()
+                for n, ok, m in revive_many(reg, names, False):
+                    log("restart %s: %s" % (n, m))
+                do_sync()
+    with contextlib.suppress(Exception):  # stash marks and crashed viewers (never kills a disabled session here)
+        cmd_reconcile(argparse.Namespace(boot=False, dry_run=False))
+    # needs -> notify-user lanes (job sessions only: pane sessions have the Notification hook)
+    todo = []
+
+    def needs(r):
+        for name, row in sorted(r["sessions"].items()):
+            want = row["needs"] if row["kind"] == "job" else ""
+            if want != row["notified_needs"]:
+                todo.append((name, want))
+                row["notified_needs"] = want
+    mutate(needs)
+    for name, want in todo:
+        if want:
+            notify("needs", name, want)
+        else:
+            notify("clear", name)
+    snap = public_snapshot(load_registry(), now)
+    write_atomic(os.path.join(ensure_state_dir(), "status.json"), json.dumps(snap, indent=1, sort_keys=True) + "\n")
+    return snap
+
+
+class Snap:
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()
+        self.data = {"time": 0, "pid": os.getpid(), "sessions": {}, "waiting": []}
+
+    def set(self, d):
+        with self.lock:
+            self.data = d
+
+    def get(self):
+        with self.lock:
+            return self.data
+
+
+def make_server(snap, port):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import unquote, urlsplit
+
+    class H(BaseHTTPRequestHandler):
+        server_version = "fleet"
+        protocol_version = "HTTP/1.0"
+        timeout = 10  # a slow or stalled client must not hold a thread for ever
+
+        def log_message(self, *a):
+            pass
+
+        def send_json(self, code, obj):
+            body = json.dumps(obj, indent=1, sort_keys=True).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def reject(self):
+            self.send_response(405)
+            self.send_header("Allow", "GET")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = reject
+
+        def do_GET(self):
+            real = self.server.server_address[1]
+            host = self.headers.get("Host", "")
+            if host not in ("127.0.0.1:%d" % real, "localhost:%d" % real):
+                return self.send_json(403, {"error": "bad Host header"})
+            path = urlsplit(self.path).path.rstrip("/") or "/"
+            d = snap.get()
+            if path == "/health":
+                return self.send_json(200, {"ok": True, "pid": d["pid"], "time": d["time"], "sessions": len(d["sessions"])})
+            if path == "/sessions":
+                return self.send_json(200, d["sessions"])
+            if path.startswith("/sessions/"):
+                name = unquote(path[len("/sessions/"):])
+                if name in d["sessions"]:
+                    return self.send_json(200, d["sessions"][name])
+                return self.send_json(404, {"error": "no such session"})
+            if path == "/waiting":
+                return self.send_json(200, d["waiting"])
+            if path == "/scopes":
+                sc = {}
+                for n, r in d["sessions"].items():
+                    sc.setdefault(r["scope"], []).append(n)
+                return self.send_json(200, sc)
+            return self.send_json(404, {"error": "not found"})
+
+    return ThreadingHTTPServer(("127.0.0.1", port), H)
+
+
+def cmd_watch(a):
+    d = ensure_state_dir()
+    pf = open(os.path.join(d, "watch.pid"), "a+")
+    try:
+        fcntl.flock(pf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0  # another instance runs: exit quietly
+    pf.seek(0)
+    pf.truncate()
+    pf.write("%d\n" % os.getpid())
+    pf.flush()
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *x: stop.append(1))
+    signal.signal(signal.SIGINT, lambda *x: stop.append(1))
+    snap, server = Snap(), None
+    if not a.no_api and not a.once:
+        import threading
+        try:
+            server = make_server(snap, int(env("FLEET_PORT", "8377")))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            log("api on 127.0.0.1:%d" % server.server_address[1])
+        except (OSError, ValueError) as e:
+            log("api not started: %s" % e)
+    first = not a.no_up
+    corrupt_told = []
+    interval = num_env("FLEET_INTERVAL", 60)
+    while not stop:
+        try:
+            snap.set(tick(do_up=first, boot=a.boot))
+            first = first and not TICK["upped"]  # the start-up `up` is retried until a tick has really run it
+        except RegistryUnreadable as e:
+            log("registry not readable right now: %s" % e)
+        except RegistryCorrupt as e:
+            log("registry unreadable: %s" % e)
+            if not corrupt_told:
+                corrupt_told.append(1)
+                notify("needs", "fleet", "registry unreadable: nothing is restarted until `fleet recover` is run")
+        except Exception as e:  # the watchdog must not die on one bad tick
+            log("tick failed: %r" % e)
+        if a.once:
+            break
+        end = time.time() + interval
+        while time.time() < end and not stop:
+            time.sleep(min(0.25, max(0.0, end - time.time())))
+    if server:
+        server.shutdown()
+    return 0
+
+
+# ---------------------------------------------------------------- tmux: entries, stash, peek, menu, view
+CLIENT_RE = re.compile(r"^[A-Za-z0-9/_.:-]{1,80}$")
+
+
+def fleet_cmd(*args):
+    """A shell command line that runs this tool with the FLEET_* variables of the caller (tmux windows and menu
+    items do not inherit the caller's environment). Every argument is shell-quoted."""
+    pre = ["%s=%s" % (k, shlex.quote(v)) for k, v in sorted(os.environ.items()) if k.startswith("FLEET_")]
+    me = shlex.quote(os.path.realpath(sys.argv[0]))
+    return " ".join((["env"] + pre if pre else []) + [me] + [shlex.quote(x) for x in args])
+
+
+def tq(s):
+    """one tmux command-parser word: single quotes, a quote inside as '\\''; `#` doubled (formats are expanded)"""
+    return "'" + s.replace("#", "##").replace("'", "'\\''") + "'"
+
+
+def menu_label(s, n=40):
+    """text for a tmux menu / popup title: no control characters, `#` doubled, never a leading dash (= disabled)"""
+    t = clean(s, n).lstrip("- ").replace("#", "##")
+    return t or "?"
+
+
+def target_client(explicit=None):
+    """Default target = the most recently active attached client whose session is not skipped (FLEET_SKIP, default
+    ^rcterm-, the need-attention rule); `--client` overrides. None when there is none."""
+    if explicit:
+        return explicit if CLIENT_RE.match(explicit) else None
+    rc, out = tm("list-clients", "-F", "#{client_activity}\t#{client_name}\t#{session_name}")
+    skip = skip_re()
+    best, best_act = None, -1.0
+    for line in out.splitlines() if rc == 0 else []:
+        f = line.split("\t")
+        if len(f) != 3 or (skip and skip.search(f[2])) or not CLIENT_RE.match(f[1]):
+            continue
+        try:
+            act = float(f[0] or 0)
+        except ValueError:
+            act = 0.0
+        if act > best_act:
+            best, best_act = f[1], act
+    return best
+
+
+def entry_name_ok(name):
+    return bool(name and SCOPE_RE.match(name) and name != "home" and guard(name))
+
+
+def build_entries(snap, ent, reg):
+    """{name: {state, windows, sessions: [{name, waits}], in_tmux}} from tmux + fleet state + the registry."""
+    out = {}
+    for p in (snap or {"panes": []})["panes"]:
+        e = out.setdefault(p["session"], {"state": "active", "wins": set(), "in_tmux": True, "mark": False})
+        e["wins"].add(p["window"])
+        if p["stashed"]:
+            e["mark"] = True
+    res = {}
+    for name, e in out.items():
+        stashed = e["mark"] or name in ent["stashed"]
+        res[name] = {"state": "stashed" if stashed else "active", "windows": len(e["wins"]), "in_tmux": True}
+    for name in ent["stashed"]:
+        res.setdefault(name, {"state": "stashed", "windows": 0, "in_tmux": False})
+    for name, d in ent["disabled"].items():
+        res[name] = {"state": "disabled", "windows": len(d.get("windows", [])), "in_tmux": name in out}
+    for name, r in reg["sessions"].items():
+        if r["scope"] in res:
+            res[r["scope"]].setdefault("sessions", []).append({"name": name, "waits": bool(r["needs"])})
+    for e in res.values():
+        e.setdefault("sessions", [])
+        e["sessions"].sort(key=lambda x: (not x["waits"], x["name"]))
+    return res
+
+
+def cmd_list(a):
+    reg = sync_ro()
+    res = build_entries(tmux_snapshot(), load_entries(), reg)
+    if a.json:
+        say(json.dumps(res, indent=1, sort_keys=True))
+        return 0
+    rows = [["ENTRY", "STATE", "WINDOWS", "CLAUDE SESSIONS (* = waits)"]]
+    for n in sorted(res, key=lambda n: ({"active": 0, "stashed": 1, "disabled": 2}[res[n]["state"]], n)):
+        e = res[n]
+        rows.append([clean(n, 40), e["state"] + (" (NAME CLASH: a tmux session of that name exists)" if e["state"] == "disabled" and e["in_tmux"] else "" if e["in_tmux"] or e["state"] == "disabled" else " (not in tmux)"), str(e["windows"]),
+                     " ".join(s["name"] + ("*" if s["waits"] else "") for s in e["sessions"]) or "-"])
+    w = [max(len(r[i]) for r in rows) for i in range(3)]
+    for r in rows:
+        say("  ".join(c.ljust(w[i]) for i, c in enumerate(r[:3])) + "  " + r[3])
+    if getattr(a, "pause", False) and sys.stdin.isatty():
+        input("\n[enter closes] ")
+    return 0
+
+
+def tm_client_session(client):
+    rc, out = tm("display-message", "-p", "-c", client, "#{session_name}")
+    return out.strip() if rc == 0 else ""
+
+
+def ensure_home():
+    if tm("has-session", "-t", "=home")[0] != 0:
+        tm("new-session", "-d", "-s", "home", "-c", HOME)
+
+
+def move_clients_home(entry):
+    """every client in the entry goes to `home` (created in ~ only when a client needs it); returns the count"""
+    rc, out = tm("list-clients", "-t", "=" + entry, "-F", "#{client_name}")
+    clients = [c.strip() for c in out.splitlines() if c.strip()] if rc == 0 else []
+    if clients:
+        ensure_home()
+    for c in clients:
+        tm("switch-client", "-c", c, "-t", "=home")
+    return len(clients)
+
+
+def switch_to(entry, client):
+    if client:
+        tm("switch-client", "-c", client, "-t", "=" + entry)
+    return bool(client)
+
+
+def proc_children():
+    """{ppid: [pid, ...]} from the process table (proc_root)"""
+    kids = {}
+    try:
+        names = os.listdir(proc_root())
+    except OSError:
+        return kids
+    for n in names:
+        if n.isdigit():
+            kids.setdefault(ppid_of(int(n)), []).append(int(n))
+    return kids
+
+
+def proc_comm(pid):
+    try:
+        with open(os.path.join(proc_root(), str(pid), "stat")) as f:
+            t = f.read()
+        return t[t.index("(") + 1:t.rindex(")")]
+    except (OSError, ValueError):
+        return ""
+
+
+def pane_runs(pid, kids):
+    """what runs under a pane's root process: ([claude (pid, comm)], [other (pid, comm)])"""
+    if not pid:
+        return [], []
+    claude, others, stack, seen = [], [], list(kids.get(pid, [])), set()
+    while stack:
+        c = stack.pop()
+        if c in seen:
+            continue
+        seen.add(c)
+        stack.extend(kids.get(c, []))
+        comm = proc_comm(c)
+        (claude if comm == "claude" else others).append((c, comm))
+    return claude, others
+
+
+def resolve_entry(a):
+    """entry name from the argument or from --current: (name, client, error). --current needs --client, or to be run
+    from a tmux pane ($TMUX_PANE): never "whichever client was active last" (a script would hit the user's entry)."""
+    client = target_client(a.client)
+    if a.current:
+        pane = os.environ.get("TMUX_PANE", "")
+        if a.client:
+            name = tm_client_session(client) if client else ""
+        elif os.environ.get("TMUX") and re.match(r"^%\d+$", pane):
+            rc, out = tm("display-message", "-p", "-t", pane, "#{session_name}")
+            name = out.strip() if rc == 0 else ""
+        else:
+            return None, client, "--current needs --client <name>, or to be run from a tmux pane"
+        if not name:
+            return None, client, "no attached client to take the current entry from"
+    else:
+        name = a.entry
+    if not name or not SCOPE_RE.match(name):
+        return None, client, "unusable entry name %s" % clean(name, 40)
+    return name, client, None
+
+
+def cmd_stash(a):
+    name, client, e = resolve_entry(a)
+    if e:
+        err(e)
+        return EXIT_USAGE
+    if not entry_name_ok(name):
+        err("%s: refused (home, or outside FLEET_NAME_PREFIX)" % clean(name, 40))
+        return EXIT_REFUSED
+    snap = tmux_snapshot()
+    panes = [p for p in (snap or {"panes": []})["panes"] if p["session"] == name]
+    if a.disable:
+        if a.dry_run:
+            return stash_disable(name, panes, a.force, True)
+        begin_mutation()
+        with action_lock():
+            return stash_disable(name, panes, a.force, False)
+    if not panes:
+        err("no tmux session %s" % name)
+        return EXIT_FAILED
+    if a.dry_run:
+        say("%s: would mark stashed and move its clients to home" % name)
+        return 0
+    entries_mutate(lambda d: d["stashed"].__setitem__(name, {"at": int(time.time())}))
+    tm("set-option", "-t", "=%s:" % name, "@fleet-stashed", "1")
+    n = move_clients_home(name)
+    say("%s: stashed (sessions and shells keep running; %d client(s) moved to home)" % (name, n))
+    return 0
+
+
+def stash_disable(name, panes, force, dry):
+    if not panes:
+        err("no tmux session %s" % name)
+        return EXIT_FAILED
+    reg = do_sync(save=not dry)
+    if BRAKE["why"]:
+        say("%s: refused: brake: %s" % (name, BRAKE["why"]))
+        return EXIT_REFUSED
+    now, kids = time.time(), proc_children()
+    hard, blockers, windows, viewed = [], [], {}, []
+    for p in panes:
+        kind, vname = classify(p, now)
+        w = windows.setdefault(p["window"], {"name": p["wname"], "panes": [], "idx": int(p["index"]) if p["index"].isdigit() else 0})
+        w["panes"].append({"cwd": p["cwd"], "session": vname if kind in ("viewer", "stale") else ""})
+        tagged = kind in ("viewer", "stale")
+        if tagged:
+            viewed.append(vname)
+            if viewer_alive(p, now):
+                continue  # only a LIVE viewer is skipped; a dead one (a stale tag) is checked like any other pane
+        claude, others = pane_runs(p["pid"], kids)
+        tracked = [n for n, r in reg["sessions"].items() if r["kind"] == "pane" and r["tmux"] and r["tmux"].rsplit(".", 1)[-1] == p["pane"]
+                   and p["pid"] and is_descendant(r["pid"], p["pid"])]
+        if claude or tracked:
+            hard.append("%s: a Claude process runs here (%s): fleet does not %s it (`fleet bg` it first, or close it yourself)" % (
+                p["wname"], ", ".join(["%s pid %d" % (c, i) for i, c in claude] or tracked), "know" if claude and not tracked else "stop"))
+        elif others:
+            blockers.append("%s: not idle, runs %s" % (p["wname"], ", ".join("%s (pid %d)" % (c, i) for i, c in others[:4])))
+        elif kind == "other" or (tagged and not SHELLS_RE.match(p["cmd"])):
+            blockers.append("%s: runs %s" % (p["wname"], p["cmd"]))
+    if hard:
+        say("%s: refused (not even --force overrides this):" % name)
+        for h in hard:
+            say("  " + h)
+        return EXIT_REFUSED
+    if blockers and not force:
+        say("%s: refused, a window runs something other than an idle shell or a viewer (--force closes it anyway):" % name)
+        for b in blockers:
+            say("  " + b)
+        return EXIT_REFUSED
+    other_views = set()
+    for p in (tmux_snapshot() or {"panes": []})["panes"]:
+        k, v = classify(p, now)
+        if p["session"] != name and v and k in ("viewer", "stale"):
+            other_views.add(v)
+    stop, busy, blocked = [], [], []
+    for n in sorted(set(viewed)):
+        r = reg["sessions"].get(n)
+        if not r or not r["managed"] or r["conflict"] or not guard(n):
+            continue
+        if n in other_views:
+            say("%s: also viewed in another entry: left running" % n)
+            continue
+        if r["kind"] != "job" or not r["job_id"]:
+            continue  # nothing running to stop (a job stopped earlier is not ours to touch)
+        stop.append(n)
+        if r["state"] != "idle":
+            busy.append("%s (%s)" % (n, r["state"]))
+        if r["needs"]:
+            blocked.append("%s (waits: %s)" % (n, clean(r["needs"], 60)))
+    if (busy or blocked) and not force:
+        say("%s: refused: stopping a job kills its turn, background shells and monitors (--force overrides):" % name)
+        for b in busy:
+            say("  busy: " + b)
+        for b in blocked:
+            say("  blocked on a need: " + b)
+        return EXIT_REFUSED
+    for b in busy:
+        say("  --force: stopping busy job %s" % b)
+    for b in blocked:
+        say("  --force: stopping job blocked on a need: %s" % b)
+    layout = [{"name": w["name"], "cwd": w["panes"][0]["cwd"], "session": w["panes"][0]["session"], "panes": w["panes"],
+               "layout": "tiled" if len(w["panes"]) > 1 else ""} for w in sorted(windows.values(), key=lambda w: w["idx"])]
+    if dry:
+        say("%s: would save %d window(s), hold and stop %s, move clients home, close the tmux session%s" % (
+            name, len(layout), " ".join(stop) or "no job", "; force-closing: " + "; ".join(blockers) if blockers else ""))
+        return 0
+    ours = [n for n in stop if not reg["sessions"][n]["hold"]]
+    entries_mutate(lambda d: (d["disabled"].__setitem__(name, {"at": int(time.time()), "windows": layout, "held": ours, "stopped": []}),
+                              d["stashed"].pop(name, None)))
+
+    def hold_all(r):
+        for n in ours:
+            r["sessions"][n]["hold"] = True
+    mutate(hold_all)
+    stopped, failed = [], []
+    for n in stop:
+        if not force:  # the idle check above is seconds old: a peer message or a cron may have woken the job since
+            now_live = Sources().running({reg["sessions"][n]["session_id"]}, reg["sessions"][n]["job_id"])
+            if now_live and (now_live["status"] != "idle" or now_live["waiting"]):
+                failed.append("%s (went busy: %s; not stopped)" % (n, clean(now_live["status"], 20)))
+                break
+        rc, out = run_claude(["stop", reg["sessions"][n]["job_id"]], stop_ok=True)
+        (failed if rc != 0 else stopped).append(n if rc == 0 else "%s (exit %s: %s)" % (n, rc, out))
+    if failed:
+        def undo(r):
+            for n in ours:
+                r["sessions"][n]["hold"] = False
+        mutate(undo)
+        entries_mutate(lambda d: d["disabled"].pop(name, None))
+        msg = "could not stop: %s." % "; ".join(failed)
+        if stopped:
+            msg += " Already stopped by this run: %s; bringing them back." % ", ".join(stopped)
+            do_sync()
+            for n, ok, m in revive_many(load_registry(), stopped, False, include_stopped=True):
+                msg += " %s: %s." % (n, m if ok is not None else "not restarted (%s)" % m)
+        err(msg + " The tmux session was left as it is.")
+        return EXIT_FAILED
+    entries_mutate(lambda d: d["disabled"][name].__setitem__("stopped", stopped))
+    moved = move_clients_home(name)
+    tm("kill-session", "-t", "=" + name)
+    do_sync()
+    say("%s: disabled (%d window(s) saved; stopped and held: %s; %d client(s) moved to home)" % (name, len(layout), " ".join(stopped) or "none", moved))
+    return 0
+
+
+def cmd_unstash(a):
+    name, client, e = resolve_entry(a)
+    if e:
+        err(e)
+        return EXIT_USAGE
+    if not entry_name_ok(name):
+        err("%s: refused (home, or outside FLEET_NAME_PREFIX)" % clean(name, 40))
+        return EXIT_REFUSED
+    ent = load_entries()
+    if name in ent["disabled"]:
+        begin_mutation()
+        with action_lock():
+            return unstash_disabled(name, ent["disabled"][name], client, a.no_switch)
+    snap = tmux_snapshot()
+    exists = any(p["session"] == name for p in (snap or {"panes": []})["panes"])
+    if name in ent["stashed"] or exists:
+        if not exists:
+            err("%s: stashed, but its tmux session is gone (reboot without a restore?); nothing to bring back" % name)
+            entries_mutate(lambda d: d["stashed"].pop(name, None))
+            return EXIT_FAILED
+        entries_mutate(lambda d: d["stashed"].pop(name, None))  # the record first: a reconcile tick must not re-mark it
+        tm("set-option", "-t", "=%s:" % name, "-u", "@fleet-stashed")
+        sw = False if a.no_switch else switch_to(name, client)
+        say("%s: unstashed%s" % (name, "" if sw else " (no client to switch)"))
+        return 0
+    err("no stashed or disabled entry %s" % name)
+    return EXIT_FAILED
+
+
+def unstash_disabled(name, d, client, no_switch):
+    if tm("has-session", "-t", "=" + name)[0] == 0:
+        err("%s: a tmux session with that name exists already; close or rename it first" % name)
+        return EXIT_FAILED
+    layout = d.get("windows", [])
+    if not layout:
+        err("%s: no saved layout" % name)
+        return EXIT_FAILED
+    held = [n for n in d.get("held", []) if NAME_RE.match(n)]
+    stopped = [n for n in d.get("stopped", []) if NAME_RE.match(n)]
+
+    def release(r):
+        for n in held:
+            if n in r["sessions"]:
+                r["sessions"][n]["hold"] = False
+                r["sessions"][n]["failed"] = False
+                r["sessions"][n]["restarts"] = []
+    mutate(release)
+    reg = do_sync()
+    msgs = []
+    for n, ok, m in revive_many(reg, [n for n in stopped if n in reg["sessions"]], False, include_stopped=True):
+        if ok is not None:
+            msgs.append("%s: %s" % (n, m))
+        elif not m.startswith("already running"):
+            msgs.append("%s: not resumed (%s)" % (n, m))
+    first = True
+    for w in layout:
+        wname = clean(w.get("name"), 60) or "w"
+        panes = w.get("panes") or [{"cwd": w.get("cwd"), "session": w.get("session")}]
+        wid = ""
+        for i, pn in enumerate(panes):
+            cwd = pn.get("cwd") if pn.get("cwd") and os.path.isdir(pn.get("cwd")) else HOME
+            sess = pn.get("session") if NAME_RE.match(pn.get("session") or "") else ""
+            cmd = [fleet_cmd("view", sess, "--shell")] if sess else []
+            if i == 0:
+                if first:
+                    rc, out = tm("new-session", "-d", "-s", name, "-n", wname, "-c", cwd, "-P", "-F", "#{window_id} #{pane_id}", *cmd)
+                else:
+                    rc, out = tm("new-window", "-d", "-t", "=%s:" % name, "-n", wname, "-c", cwd, "-P", "-F", "#{window_id} #{pane_id}", *cmd)
+            else:
+                rc, out = tm("split-window", "-d", "-t", wid, "-c", cwd, "-P", "-F", "#{window_id} #{pane_id}", *cmd)
+            ids = out.split()
+            if rc != 0 or len(ids) != 2:
+                err("%s: could not rebuild window %s" % (name, wname))
+                return EXIT_FAILED
+            first = False
+            wid = ids[0]
+            if sess:  # a per-pane tag at creation: the viewer fills in its own pid when it starts
+                tm("set-option", "-p", "-t", ids[1], "@fleet-view", "%s %d" % (sess, int(time.time())))
+        if len(panes) > 1:
+            tm("select-layout", "-t", wid, w.get("layout") or "tiled")
+    entries_mutate(lambda x: x["disabled"].pop(name, None))
+    for m in msgs:
+        say(m)
+    sw = False if no_switch else switch_to(name, client)
+    say("%s: unstashed (%d window(s) rebuilt; split windows come back as an even layout)%s" % (name, len(layout), "" if sw else "; no client to switch"))
+    return 0
+
+
+def cmd_home(a):
+    client = target_client(a.client)
+    if not client:
+        err("no attached client")
+        return EXIT_FAILED
+    ensure_home()
+    tm("switch-client", "-c", client, "-t", "=home")
+    return 0
+
+
+# ---- peek and the picker
+def pick_items(reg):
+    """viewable sessions, waiting ones first, then grouped by entry"""
+    rows = [(n, r) for n, r in reg["sessions"].items() if r["job_id"] and r["managed"] and not r["conflict"]]
+    rows.sort(key=lambda x: (not x[1]["needs"], x[1]["scope"], x[0]))
+    return rows
+
+
+def cmd_peek(a):
+    client = target_client(a.client)
+    if not client:
+        err("no attached tmux client to show the popup on (use --client)")
+        return EXIT_FAILED
+    if a.name:
+        if not NAME_RE.match(a.name):
+            err("bad session name")
+            return EXIT_USAGE
+        reg = sync_ro()
+        r = reg["sessions"].get(a.name)
+        if not r or not r["job_id"]:
+            err("%s: not a background session fleet knows" % clean(a.name, 40))
+            return EXIT_FAILED
+        cmd = fleet_cmd("view", a.name, "--no-tag")
+        title = " %s " % menu_label(a.name)
+    else:
+        cmd = fleet_cmd("pick")
+        title = " peek: pick a session "
+    rc, _ = tm("display-popup", "-c", client, "-E", "-w", "90%", "-h", "90%", "-b", "rounded", "-T", title, cmd)
+    return 0 if rc == 0 else EXIT_FAILED
+
+
+def render_pick(items, flt, sel):
+    rows, last, shown = [], None, []
+    for n, r in items:
+        if flt and flt.lower() not in n.lower() and flt.lower() not in r["scope"].lower():
+            continue
+        shown.append(n)
+    out = ["\x1b[2J\x1b[H", "  peek: type to filter, up/down, enter opens, esc cancels\r\n", "  filter> %s\r\n\r\n" % clean(flt, 40)]
+    for i, n in enumerate(shown):
+        r = dict(items)[n]
+        if r["scope"] != last:
+            last = r["scope"]
+            out.append("  \x1b[2m%s\x1b[0m\r\n" % clean(last, 40))
+        mark = "\x1b[33m*\x1b[0m" if r["needs"] else " "
+        cur = "\x1b[7m" if i == sel else ""
+        out.append("   %s%s %-30s %s\x1b[0m\r\n" % (cur, mark, clean(n, 30), clean(r["needs"], 50)))
+    return "".join(out), shown
+
+
+def cmd_pick(a):
+    reg = sync_ro()
+    items = pick_items(reg)
+    if a.list:  # plain, for scripts and tests
+        for n, r in items:
+            say("%s\t%s\t%s" % (n, r["scope"], clean(r["needs"], 80)))
+        return 0
+    if not sys.stdin.isatty():
+        err("fleet pick needs a terminal (use --list)")
+        return EXIT_FAILED
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    flt, sel, chosen = "", 0, None
+    try:
+        tty.setraw(fd)
+        while True:
+            text, shown = render_pick(items, flt, sel)
+            sel = max(0, min(sel, len(shown) - 1))
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            ch = os.read(fd, 8).decode("utf-8", "ignore")
+            if ch in ("\x03", "\x1b", "\x04"):
+                break
+            if ch in ("\r", "\n"):
+                chosen = shown[sel] if shown else None
+                break
+            if ch == "\x1b[A":
+                sel = max(0, sel - 1)
+            elif ch == "\x1b[B":
+                sel = min(len(shown) - 1, sel + 1)
+            elif ch in ("\x7f", "\x08"):
+                flt = flt[:-1]
+                sel = 0
+            elif ch.isprintable() and not ch.startswith("\x1b"):
+                flt += ch
+                sel = 0
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\x1b[2J\x1b[H")
+        sys.stdout.flush()
+    if not chosen:
+        return 0
+    return cmd_view(argparse.Namespace(name=chosen, shell=False, no_tag=True))
+
+
+# ---- the bar and the menu
+def cmd_bar(a):
+    """text for the status bar after the entry name: ` · N` = stashed + disabled entries; nothing when 0"""
+    d = read_json(entries_path())
+    n = 0
+    if isinstance(d, dict):
+        n = len(d.get("stashed") or {}) + len(d.get("disabled") or {})
+    if n:
+        sys.stdout.write(" · %d" % n)
+    return 0
+
+
+def menu_args(client, current, entries, reg):
+    """the display-menu arguments (title, then name/key/command triples) for a client; pure, for tests. Stash and
+    Disable ask first (confirm-before); results are shown on the client (--notify), never thrown away. The command carries
+    the entry NAME the label shows (resolved when the menu was built, safe by entry_name_ok), never `--current`: that would
+    be resolved again after the confirm, and a client switch in between would hit another entry."""
+    def run(*args):
+        return "run-shell -b " + tq(fleet_cmd(*args))
+
+    def ask(label, cmd):
+        return "confirm-before -p %s %s" % (tq("%s? (y/n)" % label), tq(cmd))
+    cur_ok = bool(current) and entry_name_ok(current)
+    lab = menu_label(current) if current else "?"
+    items = [("Peek a session...", "p", run("peek", "--client", client)),
+             ("%sStash %s (background)" % ("" if cur_ok else "-", lab), "s",
+              ask("Stash %s" % lab, run("stash", "--client", client, "--notify", client, "--", current)) if cur_ok else ""),
+             ("%sDisable %s" % ("" if cur_ok else "-", lab), "d",
+              ask("Disable %s (stops its jobs)" % lab, run("stash", "--disable", "--client", client, "--notify", client, "--", current)) if cur_ok else ""),
+             ("Unstash...", "u", run("menu", "--unstash", "--client", client)),
+             ("Go home", "h", run("home", "--client", client, "--notify", client)),
+             ("List entries", "l", "display-popup -c %s -E -w 80%% -h 60%% -T ' fleet entries ' %s" % (tq(client), tq(fleet_cmd("list", "--pause"))))]
+    flat = []
+    for label, key, cmd in items:
+        flat += [label, key, cmd]
+    return " fleet: %s " % lab, flat
+
+
+def unstash_menu_args(client, entries):
+    flat = []
+    keys = "123456789abcdefgimnoqrtvwxyz"
+    n = 0
+    for name in sorted(entries):
+        e = entries[name]
+        if e["state"] == "active":
+            continue
+        lab = "%s  [%s]" % (menu_label(name), e["state"])
+        ok = entry_name_ok(name)
+        cmd = "run-shell -b " + tq(fleet_cmd("unstash", "--client", client, "--notify", client, "--", name)) if ok else ""
+        flat += [lab if ok else "-" + lab, keys[n] if n < len(keys) else "", cmd]
+        n += 1
+    if not flat:
+        flat = ["(nothing stashed or disabled)", "", ""]
+    return " unstash ", flat
+
+
+def cmd_menu(a):
+    client = target_client(a.client)
+    if not client:
+        err("no attached client")
+        return EXIT_FAILED
+    reg = sync_ro()
+    entries = build_entries(tmux_snapshot(), load_entries(), reg)
+    if a.unstash:
+        title, flat = unstash_menu_args(client, entries)
+    else:
+        title, flat = menu_args(client, tm_client_session(client), entries, reg)
+    rc, _ = tm("display-menu", "-c", client, "-T", title, "-x", "R", "-y", "S", *flat)
+    return 0 if rc == 0 else EXIT_FAILED
+
+
+# ---- reconcile: marks, viewers after a restore
+def cmd_reconcile(a):
+    """After a tmux restore (and every watchdog tick, without --boot): re-apply stash marks; put a viewer back where
+    its pane is tagged as a viewer whose recorded process is dead; with --boot also start the viewer in a restored
+    bare idle shell that is the only pane of a window named after the session (typed in, never respawn -k). Never kills
+    a session, a window or a pane the user may be using: a disabled entry whose name exists in tmux is only reported."""
+    do_sync(save=not a.dry_run)
+    snap = tmux_snapshot()
+    if snap is None:
+        say("tmux does not answer: nothing to reconcile")
+        return 0
+    ent = load_entries()
+    reg = load_registry_tolerant()
+    now = time.time()
+    by_session, by_window = {}, {}
+    for p in snap["panes"]:
+        by_session.setdefault(p["session"], []).append(p)
+        by_window.setdefault(p["window"], []).append(p)
+    rc, out = tm("display-message", "-p", "#{start_time}")
+    start = int(out.strip()) if rc == 0 and out.strip().isdigit() else 0
+    for name, rec in sorted(ent["stashed"].items()):  # marks live in the tmux server: fleet state is the source
+        ps = by_session.get(name)
+        if not ps or any(p["stashed"] for p in ps):
+            continue
+        if start and start > int(rec.get("at", 0)):  # a new server since the stash (a reboot): the mark was lost
+            if not a.dry_run:
+                tm("set-option", "-t", "=%s:" % name, "@fleet-stashed", "1")
+            say("%s: stash mark restored" % name)
+        else:  # the same server, session re-created under that name since: not the stashed one
+            if not a.dry_run:
+                entries_mutate(lambda d, n=name: d["stashed"].pop(n, None))
+            say("%s: a new tmux session took the name of a stashed entry: the stash record is dropped" % name)
+    for name in sorted(ent["disabled"]):
+        if name in by_session:
+            say("%s: NAME CLASH: disabled in fleet, but a tmux session of that name exists (left alone; `fleet unstash` refuses until it is closed or renamed)" % name)
+    recorded = resurrect_panes() if a.boot else set()
+
+    def candidates(snap):
+        """[(session name, row, 'respawn' | 'type', pane)] the viewers to put back, one per session, from this snapshot"""
+        by_session, by_window = {}, {}
+        for p in snap["panes"]:
+            by_session.setdefault(p["session"], []).append(p)
+            by_window.setdefault(p["window"], []).append(p)
+        found, kids = [], None
+        for sname, r in sorted(reg["sessions"].items()):  # viewers
+            if not (r["job_id"] and r["managed"] and r["job_row"] and not r["hold"] and not r["conflict"] and guard(sname)):
+                continue
+            if r["scope"] in ent["disabled"]:
+                continue
+            for p in by_session.get(r["scope"], []):
+                kind, vname = classify(p, now)
+                how = ""
+                if kind == "stale" and vname == sname:
+                    how = "respawn"  # tagged as our viewer, process dead, bare shell for a while
+                elif a.boot and kind == "shell" and p["wname"] == sname and len(by_window[p["window"]]) == 1 and p["pane"] not in recorded:
+                    # (a pane the tmux restore itself fills, from claude_sessions.tsv, is left to it)
+                    kids = kids or proc_children()
+                    if p["pid"] and not kids.get(p["pid"]):
+                        how = "type"  # a restored idle shell: type the command in, kill nothing
+                if how:
+                    found.append((sname, r, how, p))
+                    break
+        return found
+
+    todo = candidates(snap)
+    if a.boot and not a.dry_run and any(how == "type" for _, _, how, _ in todo):
+        snap = settle_panes(snap)  # the restore is still filling panes: type nothing until they stopped changing
+        todo = candidates(snap)
+    for sname, r, how, p in todo:
+        if not a.dry_run:
+            if not pane_is_bare_shell(p["pane"], p["pid"]):
+                say("%s: pane %s:%s is not a bare idle shell right now: nothing typed or respawned" % (sname, p["session"], p["wname"]))
+                continue
+            cwd = r["dir"] if r["dir"] and os.path.isdir(r["dir"]) else HOME
+            cmd = fleet_cmd("view", sname, "--shell")
+            tm("set-option", "-p", "-t", p["pane"], "@fleet-view", "%s %d" % (sname, int(now)))
+            if how == "respawn":
+                tm("respawn-pane", "-k", "-t", p["pane"], "-c", cwd, cmd)
+            else:
+                tm("send-keys", "-t", p["pane"], "-l", cmd)
+                tm("send-keys", "-t", p["pane"], "Enter")
+        say("%s: viewer put back in %s:%s" % (sname, p["session"], p["wname"]))
+    return 0
+
+
+def resurrect_panes():
+    """pane ids that tmux-resurrect's restore fills itself: the panes listed in its claude_sessions.tsv (session:window.pane)"""
+    rc, out = tm("show-options", "-gqv", "@resurrect-dir")
+    d = out.strip() if rc == 0 and out.strip() else os.path.join(env("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")), "tmux", "resurrect")
+    try:
+        with open(os.path.join(d, "claude_sessions.tsv")) as f:
+            keys = {line.split("\t")[0] for line in f if line.strip()}
+    except OSError:
+        return set()
+    rc, out = tm("list-panes", "-a", "-F", "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}")
+    ids = set()
+    for line in out.splitlines() if rc == 0 else []:
+        f = line.split("\t")
+        if len(f) == 2 and f[1] in keys:
+            ids.add(f[0])
+    return ids
+
+
+def settle_panes(snap):
+    """Wait until no pane's foreground command has changed for FLEET_BOOT_SETTLE seconds (default 5), at most
+    FLEET_BOOT_SETTLE_MAX (default 30). The tmux restore types its own commands into the restored panes; whatever fleet types
+    in the meantime lands in the same input buffer. Returns the last snapshot."""
+    quiet, end = num_env("FLEET_BOOT_SETTLE", 5), time.time() + num_env("FLEET_BOOT_SETTLE_MAX", 30)
+
+    def sig(sn):
+        return sorted((p["pane"], p["cmd"]) for p in sn["panes"])
+    last, since = sig(snap), time.time()
+    while time.time() < end and time.time() - since < quiet:
+        time.sleep(poll())
+        nxt = tmux_snapshot()
+        if nxt is None:
+            break
+        snap = nxt
+        if sig(snap) != last:
+            last, since = sig(snap), time.time()
+    return snap
+
+
+def pane_is_bare_shell(pane, pid):
+    """right now: the pane's foreground command is a shell and nothing runs under the pane's root process"""
+    rc, out = tm("list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_command}")
+    cmd = None
+    for line in out.splitlines() if rc == 0 else []:
+        f = line.split("\t")
+        if len(f) == 2 and f[0] == pane:
+            cmd = clean(f[1], 40)
+    return bool(cmd and SHELLS_RE.match(cmd) and pid and not proc_children().get(pid))
+
+
+# ---- view
+_COUNTDOWN = {"shown": False}
+
+
+def countdown(label, remaining):
+    m, s = divmod(int(max(0, remaining)), 60)
+    line = "%s  (%d:%02d left)" % (label, m, s)
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\x1b[2K" + line)
+        sys.stdout.flush()
+    elif not _COUNTDOWN["shown"] or int(remaining) % 30 == 0:
+        _COUNTDOWN["shown"] = True
+        say(line)
+
+
+def tag_window(name, on):
+    """the viewer marks its own PANE (`@fleet-view` = "<name> <epoch> <pid>") so tmux-side code trusts the tag and the
+    recorded pid, not the command name; cleared when the viewer ends on its own"""
+    pane = os.environ.get("TMUX_PANE", "")
+    if not (os.environ.get("TMUX") and re.match(r"^%\d+$", pane)):
+        return
+    if on:
+        tm("set-option", "-p", "-t", pane, "@fleet-view", "%s %d %d" % (name, int(time.time()), os.getpid()))
+    else:
+        tm("set-option", "-p", "-u", "-t", pane, "@fleet-view")
+
+
+def cmd_view(a):
+    """Loop around `claude attach`. Tested live (2.1.325): a respawn makes the client print "Session <job> has
+    exited." and quit with status 0, while the job gets a NEW pid; Ctrl+Z inside the client does not end it, it
+    stops it (SIGTSTP; WIFSTOPPED), the session keeps its pid; Left arrow only switches to the agent view inside
+    the same client. So: stopped client = deliberate detach, end the loop; client exited and the job has a NEW
+    pid = respawn, attach again; client exited, the SAME pid alive = detach, end. Job not there yet (boot order:
+    tmux restore before `fleet up`), no process, or row missing: wait with a visible countdown, bounded by
+    FLEET_VIEW_WAIT (default 300 s), then give up."""
+    name = a.name
+    attaches = []
+    wait_total = num_env("FLEET_VIEW_WAIT", 300)
+    tagged = not getattr(a, "no_tag", False)
+    if tagged:
+        tag_window(name, True)
+    try:
+        while True:
+            row = load_registry_tolerant()["sessions"].get(name)
+            if not row or not guard(name) or not NAME_RE.match(name):
+                say("fleet view: %s is not a session fleet knows" % clean(name, 60))
+                return 1
+            job = row["job_id"]
+            if not job and not row["managed"]:
+                say("fleet view: %s is not a background session (fleet bg it first)" % name)
+                return 1
+            jobfile = os.path.join(claude_home(), "jobs", job, "state.json") if job and JOB_RE.match(job) else ""
+            cur = live_bg(name, job) if job else None
+            if cur is None:
+                t0 = time.time()
+                label = "waiting for %s (job %s)" % (name, "not started yet" if jobfile and os.path.exists(jobfile) else "not there yet")
+                while True:
+                    row = load_registry_tolerant()["sessions"].get(name) or row
+                    job = row["job_id"]
+                    jobfile = os.path.join(claude_home(), "jobs", job, "state.json") if job and JOB_RE.match(job) else ""
+                    cur = live_bg(name, job) if job else None
+                    if cur is not None:
+                        break
+                    left = wait_total - (time.time() - t0)
+                    if left <= 0:
+                        say("\ngave up waiting for %s" % name)
+                        return 1
+                    countdown(label, left)
+                    time.sleep(max(poll(), 1.0) if wait_total > 5 else poll())
+                if sys.stdout.isatty():
+                    sys.stdout.write("\n")
+            before = cur["pid"]
+            attaches[:] = [t for t in attaches if time.time() - t < 60] + [time.time()]
+            if len(attaches) > 20:
+                say("fleet view: attached 20 times in a minute; stopping")
+                return 1
+            cwd = row["dir"] if row["dir"] and os.path.isdir(row["dir"]) else None
+            rc, how = run_claude(["attach", job], cwd=cwd, capture=False)
+            if how == "stopped":  # Ctrl+Z in the client: a deliberate detach, the session keeps running
+                say("detached from %s (the session keeps running)" % name)
+                return 0
+            end = time.time() + num_env("FLEET_SETTLE", 10)
+            while True:
+                now = live_bg(name, job)
+                if now is not None and now["pid"] != before:
+                    break  # a new process: the job was respawned, attach again
+                if now is not None:
+                    say("detached from %s (the session keeps running)" % name)
+                    return 0
+                if time.time() >= end:
+                    break  # no process: the outer loop waits for one
+                time.sleep(poll())
+    finally:
+        if tagged:
+            tag_window(name, False)
+        if getattr(a, "shell", False) and sys.stdin.isatty():
+            sh = os.environ.get("SHELL") or "/bin/sh"
+            os.execvp(sh, [sh])
+
+
+# ---------------------------------------------------------------- CLI
+def build_parser():
+    p = argparse.ArgumentParser(prog="fleet", description="background Claude sessions: registry, watchdog, tmux views")
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("sync")
+    s = sub.add_parser("status")
+    s.add_argument("filter", nargs="?")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--no-sync", action="store_true")
+    s = sub.add_parser("waiting")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("bg")
+    s.add_argument("target", nargs="?")
+    s.add_argument("--all", action="store_true")
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--model")
+    s.add_argument("--effort")
+    s = sub.add_parser("up")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--include-stopped", action="store_true")
+    s.add_argument("--include-missing", action="store_true")
+    s.add_argument("--boot", action="store_true")
+    for n in ("hold", "release"):
+        s = sub.add_parser(n)
+        s.add_argument("name")
+    s = sub.add_parser("watch")
+    s.add_argument("--once", action="store_true")
+    s.add_argument("--no-api", action="store_true")
+    s.add_argument("--no-up", action="store_true")
+    s.add_argument("--boot", action="store_true")
+    s = sub.add_parser("view")
+    s.add_argument("name")
+    s.add_argument("--shell", action="store_true")
+    s.add_argument("--no-tag", action="store_true")
+    for n in ("stash", "unstash"):
+        s = sub.add_parser(n)
+        s.add_argument("entry", nargs="?")
+        s.add_argument("--current", action="store_true")
+        s.add_argument("--client")
+        s.add_argument("--dry-run", action="store_true")
+        s.add_argument("--notify")
+        if n == "stash":
+            s.add_argument("--disable", action="store_true")
+            s.add_argument("--force", action="store_true")
+        else:
+            s.add_argument("--no-switch", action="store_true")
+    s = sub.add_parser("recover")
+    s.add_argument("--from", dest="source")
+    s.add_argument("--fresh", action="store_true")
+    s = sub.add_parser("list")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--pause", action="store_true")
+    s = sub.add_parser("peek")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--client")
+    s = sub.add_parser("pick")
+    s.add_argument("--list", action="store_true")
+    s = sub.add_parser("menu")
+    s.add_argument("--client")
+    s.add_argument("--unstash", action="store_true")
+    s = sub.add_parser("home")
+    s.add_argument("--client")
+    s.add_argument("--notify")
+    s = sub.add_parser("reconcile")
+    s.add_argument("--boot", action="store_true")
+    s.add_argument("--dry-run", action="store_true")
+    sub.add_parser("bar")
+    s = sub.add_parser("wake", usage="fleet wake <name> [--timeout S] [--force]", epilog="example: fleet wake infra-uptime",
+                       description="bring a sleeping (retired) or down session back with its recorded model, effort and mode; prints `awake`")
+    s.add_argument("name")
+    s.add_argument("--timeout", type=float, default=60.0)
+    s.add_argument("--force", action="store_true", help="also wake a held or stopped-on-purpose session")
+    s = sub.add_parser("who", usage="fleet who [--json] [name]", epilog="example: fleet who",
+                       description="the named sessions: name, entry, role, dir, awake|asleep|down|held, purpose")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("new", usage="fleet new <name> --dir <dir> --model <m> --effort <e> [--role <r>] [--purpose <text>] [--permission-mode <mode>] [--always-on] <brief>",
+                       epilog='example: fleet new shop-research --dir ~/dev/shop --model opus --effort high --purpose "market research" "Research X and report back."',
+                       description="create a named background session from scratch (model and effort are required)")
+    s.add_argument("name")
+    s.add_argument("brief")
+    s.add_argument("--dir")
+    s.add_argument("--model")
+    s.add_argument("--effort")
+    s.add_argument("--role")
+    s.add_argument("--purpose")
+    s.add_argument("--permission-mode", dest="permission_mode")
+    s.add_argument("--always-on", dest="always_on", action="store_true")
+    s = sub.add_parser("owns")
+    s.add_argument("session_id")
+    return p
+
+
+def cmd_recover(a):
+    """after a damaged registry: start from a backup file, or from nothing (the holds, ids and recorded models are lost)"""
+    flag = recovery_flag()
+    if not os.path.exists(flag):
+        say("the registry is fine: nothing to recover")
+        return 0
+    d = ensure_state_dir()
+    if a.fresh:
+        data = json.dumps({"version": VERSION, "sessions": {}}) + "\n"
+    elif a.source:
+        try:
+            data = open(a.source).read()
+            x = json.loads(data)
+            if not isinstance(x, dict) or not isinstance(x.get("sessions"), dict):
+                raise ValueError("not a registry")
+        except (OSError, ValueError) as e:
+            err("%s is not a usable registry (%s)" % (clean(a.source, 80), clean(e, 60)))
+            return EXIT_FAILED
+    else:
+        err("give --from <backup file> or --fresh")
+        return EXIT_USAGE
+    with locked():
+        write_atomic(registry_path(), data)
+        os.unlink(flag)
+    say("registry restored; run `fleet sync`")
+    return 0
+
+
+def run_handler(fn, a):
+    """--notify <client>: the action's output also goes to that tmux client (display-message), never to /dev/null"""
+    nc = getattr(a, "notify", None)
+    if not (nc and CLIENT_RE.match(nc)):
+        return fn(a)
+    import io
+    buf = io.StringIO()
+    rc = EXIT_FAILED
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = fn(a)
+    except (RegistryCorrupt, Busy) as e:
+        buf.write(str(e))
+        rc = EXIT_REFUSED
+    text = clean(buf.getvalue(), 220) or "done"
+    sys.stdout.write(buf.getvalue())
+    tm("display-message", "-c", nc, "-d", "8000", "--", "fleet: " + text.replace("#", "##"))
+    return rc
+
+
+def main(argv=None):
+    parser = build_parser()
+    a = parser.parse_args(argv)
+    try:
+        return dispatch(parser, a)
+    except RegistryCorrupt as e:
+        err(str(e))
+        return EXIT_REFUSED
+    except Busy as e:
+        err(str(e))
+        return EXIT_REFUSED
+
+
+def dispatch(parser, a):
+    if a.cmd == "sync":
+        reg = do_sync()
+        if BRAKE["why"]:
+            say("brake: %s. Nothing written." % BRAKE["why"])
+            return EXIT_REFUSED
+        say("synced: %d session(s), %d job(s), %d pane(s)" % (
+            len(reg["sessions"]), sum(1 for r in reg["sessions"].values() if r["kind"] == "job"),
+            sum(1 for r in reg["sessions"].values() if r["kind"] == "pane")))
+        return 0
+    handlers = {"status": cmd_status, "waiting": cmd_waiting, "bg": cmd_bg, "up": cmd_up, "watch": cmd_watch,
+                "view": cmd_view, "owns": cmd_owns, "stash": cmd_stash, "unstash": cmd_unstash, "list": cmd_list,
+                "peek": cmd_peek, "pick": cmd_pick, "menu": cmd_menu, "home": cmd_home, "reconcile": cmd_reconcile,
+                "bar": cmd_bar, "recover": cmd_recover, "wake": cmd_wake, "who": cmd_who, "new": cmd_new}
+    if a.cmd in handlers:
+        return run_handler(handlers[a.cmd], a)
+    if a.cmd == "hold":
+        return cmd_hold(a, True)
+    if a.cmd == "release":
+        return cmd_hold(a, False)
+    parser.print_help()
+    return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

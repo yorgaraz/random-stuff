@@ -13,7 +13,8 @@ max-history=50
 layer=overlay
 
 on-button-left=invoke-default-action
-on-button-right=invoke-default-action
+# right click = dismiss the whole stack of a grouped notification (the "(64)" kind) in one go
+on-button-right=dismiss-group
 on-button-middle=dismiss
 
 [app-name="KDE Connect"]

@@ -48,6 +48,10 @@ if [ "${1:-}" != --save-on ]; then
       sleep 1
       "$plugins/tmux-resurrect/scripts/restore.sh"
       say "restore.sh exit $?, sessions now: $(tmux list-sessions 2>/dev/null | wc -l)"
+      # fleet: re-apply stash marks, keep disabled entries closed, put viewers back (fleet state is the source)
+      if command -v fleet >/dev/null 2>&1; then
+        say "fleet reconcile: $(timeout 90 fleet reconcile --boot 2>&1 | tr '\n' ';')"
+      fi
     else
       say "no restore: $dir/last not found"
     fi
