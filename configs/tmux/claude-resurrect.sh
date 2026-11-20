@@ -62,6 +62,27 @@ drop_disabled() {
   ' "$1" > "$1.tmp" && mv -f "$1.tmp" "$1"
 }
 
+# Panes that only VIEW a background job (`claude attach <job>`, e.g. opened by claude-resume) write no session
+# file with a tmux field: find them by process tree. Prints "<pane_id>\t<session id>\t<cwd>".
+attach_panes() {
+  local procs id ppid job sid cwd
+  procs=$(ps -eo pid=,ppid=,args= 2>/dev/null)
+  while IFS=$'\t' read -r id ppid; do
+    job=$(awk -v root="$ppid" '
+      { p = $1; par[p] = $2; $1 = $2 = ""; sub(/^ +/, ""); cmd[p] = $0 }
+      END {
+        for (p in cmd) if (cmd[p] ~ /^([^ ]*\/)?claude attach [0-9a-f]+$/) {
+          q = p; n = 0
+          while ((q in par) && q != root && n++ < 20) q = par[q]
+          if (q == root) { k = split(cmd[p], a, " "); print a[k]; exit }
+        }
+      }' <<<"$procs")
+    [[ $job =~ ^[0-9a-f]{8}$ ]] || continue
+    IFS=$'\t' read -r sid cwd < <(jq -r '[.sessionId // "", .cwd // ""] | @tsv' "$HOME/.claude/jobs/$job/state.json" 2>/dev/null) || continue
+    [[ $sid =~ ^[0-9a-f-]{36}$ ]] && printf '%s\t%s\t%s\n' "$id" "$sid" "$cwd"
+  done < <("$tmux" list-panes -a -F $'#{pane_id}\t#{pane_pid}')
+}
+
 save() {
   [[ -f $1 ]] && { drop_helpers "$1"; drop_disabled "$1"; }
   local f pid kind sid cwd pane id key
@@ -72,6 +93,9 @@ save() {
     [[ $(cat "/proc/$pid/comm" 2>/dev/null) == claude ]] || continue # file left behind by a crash
     row_of["%${pane##*%}"]="$sid"$'\t'"$cwd"
   done
+  while IFS=$'\t' read -r id sid cwd; do
+    [[ -z ${row_of[$id]} ]] && row_of[$id]="$sid"$'\t'"$cwd"
+  done < <(attach_panes)
   # one row per session:window.pane, so grouped sessions get every name they are known by
   mkdir -p "$(dirname "$map")"
   while IFS=$'\t' read -r id key; do
@@ -93,6 +117,21 @@ restore() {
     return
   fi
   cd "$cwd" 2>/dev/null || echo "claude-resurrect: $cwd is gone, resuming from $PWD"
+  # claude-resume never starts a second copy: it attaches to the background job that holds the conversation,
+  # exits 10 when the conversation runs nowhere and has no job (then resume it here, as before), else explains.
+  if command -v claude-resume >/dev/null 2>&1; then
+    if [[ -n $CLAUDE_RESURRECT_DRY ]]; then
+      echo "claude-resume --restore $sid"
+      return
+    fi
+    local rc=0
+    claude-resume --restore "$sid" || rc=$?
+    case $rc in
+      10) ;;                 # runs nowhere, no background job: resume it in this pane
+      0) return ;;           # attached (and later detached)
+      *) echo "claude-resurrect: claude-resume exit $rc for $sid; left a shell here"; return ;;
+    esac
+  fi
   ${CLAUDE_RESURRECT_DRY:+echo} exec claude --resume "$sid"
 }
 

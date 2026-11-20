@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""claude-resume [name | session-id] [--model M] [--effort E] [--no-attach] [--dry-run] [--yes]: open a background Claude session without making a copy.
+
+Use it instead of `claude -c` / `claude --resume`. With no name it picks the session of the current directory.
+  1. Finds the job rows of that name (also "name (2)" copies) and the ONE conversation file that holds the work
+     (a job made by "Move to background" has no file of its own: its work sits in the file that points to it).
+  2. Conversation open in a tmux pane: tells you the pane (and switches to it), never starts a copy.
+  3. One clean row: awake -> attach; asleep -> claude-wake, then attach.
+  4. Copies or pointer-only rows: shows a plan, asks y/N, then stops + removes those rows and re-saves ONE row on the
+     real conversation (`claude --bg --resume <sid> -n <name>` keeps the id), keeping the newest /model and /effort.
+     Then attaches. --model / --effort override the saved ones on a fix.
+A session id (a full uuid or its first 8 hex) works too: it is resolved to the session's name and real conversation.
+--restore <session-id>: for the tmux restore after a reboot. Never asks, never repairs, never switches clients:
+  attaches to the background job that holds the conversation (waking it if needed), exits 10 when the conversation
+  has no background job and runs nowhere (the caller then resumes it in the pane), else prints why and exits 3.
+Exit 0 = ok, 2 = usage / nothing found, 3 = refused (you decide), 4 = a step failed, 10 = (--restore) resume it here.
+"""
+import glob, json, os, re, subprocess, sys, time
+
+P = os.path.expanduser("~/.claude/")
+ENV = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+TMUX = "/usr/bin/tmux"
+QUIET_STATES = {"done", "blocked", "idle", "failed", "stopped", "needs_input", None}
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, env=ENV, **kw)
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def die(msg, code=3):
+    print(f"claude-resume: {msg}")
+    sys.exit(code)
+
+
+def base_name(n):
+    return re.sub(r" \(\d+\)$", "", n or "")
+
+
+def proj_dir(cwd):
+    return P + "projects/" + re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def conv_file(sid):
+    f = glob.glob(P + f"projects/*/{sid}.jsonl")
+    return f[0] if f else None
+
+
+def records_tail(path, nbytes=200000):
+    with open(path, "rb") as fh:
+        fh.seek(max(0, os.path.getsize(path) - nbytes))
+        out = []
+        for line in fh.read().decode("utf-8", "ignore").splitlines():
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+        return out
+
+
+def pointer_source(sid, cwd):
+    """The conversation file whose `continued-in` record names sid (the work of a pointer-only job lives there)."""
+    dirs = [proj_dir(cwd)] if cwd else []
+    dirs += [d for d in glob.glob(P + "projects/*") if d not in dirs]
+    needle = re.compile(r'"continuedInSessionId"\s*:\s*"' + re.escape(sid) + '"')
+    for d in dirs:
+        for f in sorted(glob.glob(d + "/*.jsonl"), key=os.path.getmtime, reverse=True):
+            try:
+                if needle.search(open(f, errors="ignore").read()):
+                    return f
+            except Exception:
+                pass
+    return None
+
+
+SID_RE = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?")
+
+
+def resolve_id(arg, rows):
+    """A session id (uuid or 8-hex prefix) -> (full id, name or None). Exits when none or several match."""
+    sids = set()
+    for x in list(rows) + live_sessions():
+        if str(x.get("sessionId") or "").startswith(arg):
+            sids.add(x["sessionId"])
+    for f in glob.glob(P + f"projects/*/{arg}*.jsonl"):
+        b = os.path.basename(f)[:-6]
+        if re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", b):
+            sids.add(b)
+    if not sids:
+        die(f"no session or conversation with id {arg}", 2)
+    if len(sids) > 1:
+        die(f"id {arg} matches {len(sids)} sessions ({', '.join(sorted(x[:13] for x in sids))}); give more of it", 2)
+    sid = sids.pop()
+    for x in list(rows) + live_sessions():
+        if x.get("sessionId") == sid and x.get("name"):
+            return sid, base_name(x["name"])
+    f = conv_file(sid)
+    if f:
+        recs = records_tail(f, 400000)
+        titles = [r.get("customTitle") or r.get("agentName") for r in recs if r.get("customTitle") or r.get("agentName")]
+        if titles:
+            return sid, base_name(titles[-1])
+        nxt = [r.get("continuedInSessionId") for r in recs if r.get("type") == "continued-in"]
+        for x in rows:
+            if nxt and x.get("sessionId") == nxt[-1] and x.get("name"):
+                return sid, base_name(x["name"])
+    return sid, None
+
+
+def live_sessions():
+    out = []
+    for f in glob.glob(P + "sessions/*.json"):
+        try:
+            s = json.load(open(f))
+        except Exception:
+            continue
+        if alive(s.get("pid", 0)):
+            out.append(s)
+    return out
+
+
+def pane_of(pid):
+    panes = {}
+    for line in sh([TMUX, "list-panes", "-a", "-F", "#{pane_pid} #{session_name}:#{window_index}.#{pane_index}"]).stdout.splitlines():
+        a, b = line.split(" ", 1)
+        panes[a] = b
+    p = str(pid)
+    for _ in range(12):
+        if p in panes:
+            return panes[p]
+        try:
+            p = open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()[1]
+        except Exception:
+            return None
+    return None
+
+
+def job_flags(jid):
+    try:
+        st = json.load(open(P + f"jobs/{jid}/state.json"))
+    except Exception:
+        return {}, ""
+    fl, out = st.get("respawnFlags") or [], {}
+    for i, a in enumerate(fl[:-1]):
+        if a in ("--model", "--effort"):
+            out[a] = fl[i + 1]
+    return out, st.get("createdAt") or ""
+
+
+def ask(q, yes):
+    if yes:
+        return True
+    try:
+        return input(q + " [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def attach(jid, no_attach):
+    if no_attach:
+        print(f"claude-resume: ready: `claude attach {jid}`")
+        sys.exit(0)
+    os.execvpe("claude", ["claude", "attach", jid], ENV)
+
+
+def main():
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(__doc__.strip()); sys.exit(0)
+    dry, yes, no_attach = "--dry-run" in argv, "--yes" in argv, "--no-attach" in argv
+    restore = "--restore" in argv
+    if restore:
+        yes = False
+    override, args, i = {}, [], 0
+    while i < len(argv):
+        if argv[i] in ("--model", "--effort"):
+            if i + 1 >= len(argv):
+                die(f"{argv[i]} needs a value", 2)
+            override[argv[i]] = argv[i + 1]; i += 2; continue
+        if not argv[i].startswith("-"):
+            args.append(argv[i])
+        i += 1
+    if len(args) > 1:
+        die("one name at most", 2)
+
+    rows = [r for r in json.loads(sh(["claude", "agents", "--json", "--all"]).stdout or "[]")
+            if r.get("kind") == "background"]
+    cwd = os.getcwd()
+
+    want_sid = None
+    if args and SID_RE.fullmatch(args[0]):
+        want_sid, name = resolve_id(args[0], rows)
+        if not name:
+            if restore and not any(s.get("sessionId") == want_sid for s in live_sessions()):
+                sys.exit(10)
+            die(f"conversation {want_sid[:8]} has no name; open it with `claude --resume {want_sid}`", 2)
+    elif restore:
+        die("--restore needs a session id", 2)
+    elif args:
+        name = base_name(args[0])
+    else:
+        names = sorted({base_name(r.get("name")) for r in rows if r.get("cwd") == cwd and r.get("name")})
+        if len(names) == 1:
+            name = names[0]
+        elif names:
+            for i, n in enumerate(names, 1):
+                print(f"  {i}) {n}")
+            try:
+                name = names[int(input("which one? ")) - 1]
+            except Exception:
+                die("nothing picked", 2)
+        else:
+            files = sorted(glob.glob(proj_dir(cwd) + "/*.jsonl"), key=os.path.getmtime, reverse=True)
+            if not files:
+                die(f"no background session and no conversation for {cwd}; give a name (see `claude agents --all`)", 2)
+            titles = [r.get("customTitle") or r.get("agentName") for r in records_tail(files[0])
+                      if r.get("customTitle") or r.get("agentName")]
+            name = titles[-1] if titles else None
+            if not name:
+                die(f"newest conversation here ({os.path.basename(files[0])[:8]}) has no name; give one", 2)
+
+    mine = [r for r in rows if base_name(r.get("name")) == name]
+
+    # Which conversation file holds the work.
+    reals = {}
+    for r in mine:
+        sid = r.get("sessionId")
+        f = conv_file(sid) or pointer_source(sid, r.get("cwd"))
+        if f:
+            reals.setdefault(f, []).append(r)
+    if not mine:
+        f = None
+        for s in live_sessions():
+            if base_name(s.get("name")) == name and conv_file(s.get("sessionId")):
+                f = conv_file(s.get("sessionId"))
+        if not f:
+            files = sorted(glob.glob(proj_dir(cwd) + "/*.jsonl"), key=os.path.getmtime, reverse=True)
+            for cand in files[:30]:
+                if any((r.get("customTitle") or r.get("agentName")) == name for r in records_tail(cand, 400000)):
+                    f = cand; break
+        if not f:
+            die(f"no background row and no conversation named '{name}' (see `claude agents --json --all`)", 2)
+        reals[f] = []
+    if len(reals) > 1:
+        lines = [f"  {os.path.basename(f)[:8]} <- rows {', '.join(r['id'] for r in rs) or '-'}" for f, rs in reals.items()]
+        die(f"'{name}' has {len(reals)} different conversations; pick one by hand:\n" + "\n".join(lines))
+    if not reals:
+        die(f"'{name}': none of its rows has a conversation file (rows: {', '.join(r['id'] for r in mine)})", 4)
+    real_file = next(iter(reals))
+    real_sid = os.path.basename(real_file)[:-6]
+    if want_sid and want_sid != real_sid:
+        wf = conv_file(want_sid)
+        moved = bool(wf) and any(r.get("type") == "continued-in" for r in records_tail(wf)[-50:])
+        if wf and not moved and not any(r.get("sessionId") == want_sid for r in mine):
+            if restore and not any(s.get("sessionId") == want_sid for s in live_sessions()):
+                sys.exit(10)
+            die(f"id {want_sid[:8]} and the name '{name}' hold different conversations ({real_sid[:8]}); "
+                f"open it with `claude --resume {want_sid}`, or give the name")
+    if restore and not mine:
+        held = {real_sid, want_sid}
+        if not any(s.get("sessionId") in held for s in live_sessions()):
+            sys.exit(10)
+    conv_cwd = next((r.get("cwd") for r in reversed(records_tail(real_file)) if r.get("cwd")), None) \
+        or (mine[0].get("cwd") if mine else cwd)
+
+    # Open in a pane (not a background job)? Never start a copy.
+    jids = {r["id"] for r in mine}
+    panes = [s for s in live_sessions() if s.get("kind") != "bg" and not s.get("jobId")
+             and (s.get("sessionId") == real_sid or s.get("sessionId") in {r.get("sessionId") for r in mine})]
+    if panes:
+        pane = pane_of(panes[0]["pid"])
+        where = f"tmux pane {pane}" if pane else f"pid {panes[0]['pid']} (no tmux pane found)"
+        msg = f"'{name}' is open in {where}."
+        if mine:
+            msg += f" It also has background row(s) {', '.join(jids)}: close the pane or remove the row, your pick."
+        print("claude-resume: " + msg)
+        if pane and not dry and not restore and os.environ.get("TMUX"):
+            sh([TMUX, "switch-client", "-t", pane])
+        sys.exit(3 if mine else 0)
+
+    clean = (len(mine) == 1 and mine[0].get("sessionId") == real_sid
+             and not any(r.get("type") == "continued-in" for r in records_tail(real_file)[-50:]))
+    if clean:
+        r = mine[0]
+        if r.get("pid") and alive(r["pid"]):
+            print(f"claude-resume: {name} is awake (job {r['id']}).")
+        elif dry:
+            print(f"claude-resume: {name} (job {r['id']}) is asleep; would run claude-wake, then attach (dry run)."); sys.exit(0)
+        else:
+            w = subprocess.run(["claude-wake", name], env=ENV)
+            if w.returncode != 0:
+                sys.exit(w.returncode)
+        if dry:
+            sys.exit(0)
+        attach(r["id"], no_attach)
+
+    # Repair: one row on the real conversation, newest /model and /effort.
+    if restore:
+        live = [r for r in mine if r.get("pid") and alive(r["pid"])]
+        if len(live) == 1:
+            attach(live[0]["id"], no_attach)
+        print(f"claude-resume: '{name}' has copies or a pointer-only row ({', '.join(r['id'] for r in mine)}); "
+              f"nothing done at restore. Fix it with `claude-resume {name}`.")
+        sys.exit(3)
+    busy = [r for r in mine if r.get("state") not in QUIET_STATES and r.get("pid")]
+    if busy:
+        die(f"'{name}' row {busy[0]['id']} is busy (state {busy[0].get('state')}); wait for it to finish, then rerun.")
+    flags = {}
+    for r in sorted(mine, key=lambda r: job_flags(r["id"])[1]):
+        flags.update(job_flags(r["id"])[0])
+    flags.update(override)
+    cmd = ["claude", "--bg", "--resume", real_sid, "-n", name]
+    for k in ("--model", "--effort"):
+        if k in flags:
+            cmd += [k, flags[k]]
+    cmd += ["--permission-mode", "auto"]
+    print(f"claude-resume: '{name}' needs a fix: conversation {real_sid[:8]} ({conv_cwd})")
+    for r in mine:
+        own = "own file" if conv_file(r["sessionId"]) else "pointer only"
+        print(f"  remove row {r['id']}  name '{r.get('name')}'  state {r.get('state')}  {'awake' if r.get('pid') else 'asleep'}  {own}")
+    print(f"  then: (cd {conv_cwd} && {' '.join(cmd)})")
+    print("  The conversation itself is kept; only the job rows go.")
+    if dry:
+        sys.exit(0)
+    if not ask("go?", yes):
+        die("nothing done.", 3)
+    for r in mine:
+        if r.get("pid") and alive(r["pid"]):
+            sh(["claude", "stop", r["id"]])
+            for _ in range(15):
+                if not alive(r["pid"]):
+                    break
+                time.sleep(1)
+        out = sh(["claude", "rm", r["id"]])
+        if out.returncode != 0:
+            die(f"claude rm {r['id']} failed: {(out.stderr or out.stdout).strip()[:200]}", 4)
+    out = sh(cmd, cwd=conv_cwd)
+    if out.returncode != 0:
+        die(f"re-save failed: {(out.stderr or out.stdout).strip()[:300]}", 4)
+    row = None
+    for _ in range(30):
+        rows = json.loads(sh(["claude", "agents", "--json", "--all"]).stdout or "[]")
+        row = next((r for r in rows if r.get("name") == name and r.get("kind") == "background" and r.get("pid")), None)
+        if row:
+            break
+        time.sleep(1)
+    if not row:
+        die(f"'{name}' did not come up within 30 s; check `claude agents --all` and ~/.claude/daemon.log", 4)
+    time.sleep(12)
+    tail = open(P + "daemon.log", errors="ignore").read().splitlines()[-60:]
+    if any(row["id"] in l and "crashed" in l for l in tail):
+        die(f"'{name}' (job {row['id']}) crashed after the re-save; see ~/.claude/daemon.log. Report it.", 4)
+    note = "" if row.get("sessionId") == real_sid else f" (new id {str(row.get('sessionId'))[:8]})"
+    print(f"claude-resume: {name} is one row again: job {row['id']}{note}, {flags.get('--model', 'default model')} "
+          f"{flags.get('--effort', '')}.")
+    attach(row["id"], no_attach)
+
+
+if __name__ == "__main__":
+    main()

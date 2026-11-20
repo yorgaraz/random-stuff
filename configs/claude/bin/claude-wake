@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""claude-wake <name> [--dry-run]: wake an asleep background Claude session safely, so a peer can message it.
+
+Refuses (exit 3, with the reason) instead of guessing when a wake would crash or make a second copy:
+  - no job row, or more than one row with that name
+  - the conversation already runs in a live process (pane or job): it is awake, or open in a pane
+  - the row's own conversation file is missing (a respawn crashes: "source session ... not found")
+  - the conversation file ends in a `continued-in` record (the work moved to another session; a respawn forks it)
+Exit 0 = awake (or already awake as that job). Exit 2 = usage. Exit 3 = refused. Exit 4 = respawn failed / crashed.
+Meant as the only wake path sessions use: a bare `claude respawn` can crash, fork or duplicate a conversation.
+"""
+import glob, json, os, subprocess, sys, time
+
+P = os.path.expanduser("~/.claude/")
+ENV = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def live_holders(sid):
+    out = []
+    for f in glob.glob(P + "sessions/*.json"):
+        try:
+            s = json.load(open(f))
+        except Exception:
+            continue
+        if s.get("sessionId") == sid and alive(s.get("pid", 0)):
+            out.append(s)
+    return out
+
+
+def last_record_type(path):
+    with open(path, "rb") as fh:
+        fh.seek(max(0, os.path.getsize(path) - 64000))
+        lines = fh.read().decode("utf-8", "ignore").strip().splitlines()
+    for line in reversed(lines):
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        return r.get("type"), r
+    return None, {}
+
+
+def refuse(msg, code=3):
+    print(f"claude-wake: REFUSED: {msg}\n  Do not work around this: report this line to whoever coordinates your sessions.")
+    sys.exit(code)
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    dry = "--dry-run" in sys.argv
+    if len(args) != 1:
+        print(__doc__.strip().splitlines()[0]); sys.exit(2)
+    name = args[0]
+    rows = json.loads(subprocess.run(["claude", "agents", "--json", "--all"], capture_output=True, text=True,
+                                     env=ENV).stdout or "[]")
+    mine = [r for r in rows if r.get("name") == name and r.get("kind") == "background"]
+    if not mine:
+        live = [r for r in rows if r.get("name") == name and r.get("pid")]
+        if live:
+            print(f"claude-wake: {name} is awake (pid {live[0]['pid']}, {live[0].get('kind')}): SendMessage to it."); sys.exit(0)
+        refuse(f"no background session named '{name}' (see `claude agents --json --all`)")
+    if len(mine) > 1:
+        refuse(f"{len(mine)} background rows named '{name}': " + ", ".join(r.get("id", "?") for r in mine))
+    row = mine[0]
+    jid, sid = row.get("id"), row.get("sessionId")
+    others = [s for s in (json.load(open(f)) for f in glob.glob(P + "sessions/*.json"))
+              if s.get("name") == name and s.get("sessionId") != sid and alive(s.get("pid", 0))]
+    if others:
+        refuse(f"another live session is also named '{name}' ({others[0].get('kind')} pid {others[0].get('pid')}, "
+               f"conversation {str(others[0].get('sessionId'))[:8]}): two copies of one name; the user picks which stays.")
+    holders = live_holders(sid)
+    if holders:
+        kinds = ", ".join(f"{h.get('kind')} pid {h.get('pid')}" for h in holders)
+        if len(holders) == 1 and holders[0].get("jobId") == jid:
+            print(f"claude-wake: {name} is awake ({kinds}): SendMessage to it."); sys.exit(0)
+        refuse(f"conversation {sid[:8]} of '{name}' already runs in: {kinds}. A wake would add another copy.")
+    files = glob.glob(P + f"projects/*/{sid}.jsonl")
+    if not files:
+        refuse(f"'{name}' (job {jid}) has no conversation file of its own; a respawn would crash.")
+    kind, rec = last_record_type(files[0])
+    if kind == "continued-in":
+        refuse(f"'{name}' conversation {sid[:8]} continued in {str(rec.get('continuedInSessionId'))[:8]}; "
+               f"a respawn would fork it. Message the session that holds {str(rec.get('continuedInSessionId'))[:8]}.")
+    if dry:
+        print(f"claude-wake: {name} (job {jid}) is safe to wake (dry run, nothing done)."); sys.exit(0)
+    r = subprocess.run(["claude", "respawn", jid], capture_output=True, text=True, env=ENV)
+    if r.returncode != 0:
+        refuse(f"claude respawn {jid} failed: {(r.stderr or r.stdout).strip()[:200]}", 4)
+    for _ in range(30):
+        if any(s.get("jobId") == jid for s in live_holders(sid)):
+            break
+        time.sleep(1)
+    else:
+        refuse(f"'{name}' did not come up within 30 s after respawn", 4)
+    time.sleep(12)
+    try:
+        tail = open(P + "daemon.log").read().splitlines()[-300:]
+    except Exception:
+        tail = []
+    if any(jid in l and "crashed" in l for l in tail[-40:]):
+        refuse(f"'{name}' crashed right after the respawn (see ~/.claude/daemon.log)", 4)
+    print(f"claude-wake: {name} is awake (job {jid}): SendMessage to it now.")
+
+
+if __name__ == "__main__":
+    main()
